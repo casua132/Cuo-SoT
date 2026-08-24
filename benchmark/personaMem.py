@@ -66,11 +66,18 @@ class _Summary:
 
 
 class PersonaMemV1:
-    """Evaluation harness over the PersonaMem-v1 benchmark data.
+    """Evaluation harness over a PersonaMem-family benchmark (v1 or v2).
+
+    Despite the legacy name, the harness works on any benchmark sharing the on-disk
+    layout (``questions_*.csv`` + ``shared_contexts_*.jsonl``). ``benchmark="v2"``
+    selects the PersonaMem-v2 files converted into that layout by
+    :mod:`data_download`.
 
     Args:
         backend: an :class:`~backend.LLMBackend` instance used for all inference.
-        size: benchmark context size, one of ``32k``/``128k``/``1M``.
+        size: benchmark context size (``32k``/``128k``/``1M`` for v1, ``32k``/``128k``
+            for v2).
+        benchmark: which benchmark's on-disk files to evaluate (``v1`` or ``v2``).
         seed_persona: ablation only. When ``True``, the ``system`` persona messages
             are folded into the ``cot_opt`` state. Off by default because those
             messages contain the ground-truth profile and would let the model answer
@@ -87,6 +94,7 @@ class PersonaMemV1:
         self,
         backend: LLMBackend,
         size: str = "32k",
+        benchmark: str = "v1",
         seed_persona: bool = False,
         cache: bool = True,
         max_new_tokens: int = 1024,
@@ -94,10 +102,12 @@ class PersonaMemV1:
         contexts_path=None,
     ) -> None:
         self.backend = backend
+        self.benchmark = benchmark
         self.seed_persona = seed_persona
         self.cache = cache
         self.max_new_tokens = max_new_tokens
-        self.data = BenchmarkData(size=size, questions_path=questions_path, contexts_path=contexts_path)
+        self.data = BenchmarkData(size=size, benchmark=benchmark,
+                                  questions_path=questions_path, contexts_path=contexts_path)
         # shared_context_id -> {message_index: state}; one full-context walk per context.
         self._checkpoints: dict[str, dict[int, dict]] = {}
         # Toggled by evaluate_*; read by the per-call inference log.

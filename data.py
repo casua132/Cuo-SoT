@@ -103,17 +103,24 @@ def load_contexts(path: str | Path) -> dict[str, list[dict]]:
 
 
 class BenchmarkData:
-    """Access to the questions and shared contexts for a given benchmark size."""
+    """Access to the questions and shared contexts for a given benchmark size.
+
+    ``benchmark`` selects which benchmark's on-disk files to use (``v1`` vs ``v2``,
+    see :func:`utils.benchmark_dir`). Explicit ``questions_path``/``contexts_path``
+    override the benchmark/size resolution entirely.
+    """
 
     def __init__(
         self,
         size: str = "32k",
+        benchmark: str = "v1",
         questions_path: str | Path | None = None,
         contexts_path: str | Path | None = None,
     ) -> None:
         self.size = size
-        self.questions_path = Path(questions_path) if questions_path else question_csv_path(size)
-        self.contexts_path = Path(contexts_path) if contexts_path else context_jsonl_path(size)
+        self.benchmark = benchmark
+        self.questions_path = Path(questions_path) if questions_path else question_csv_path(size, benchmark)
+        self.contexts_path = Path(contexts_path) if contexts_path else context_jsonl_path(size, benchmark)
         self._contexts: dict[str, list[dict]] | None = None
 
     def load_questions(self, limit: int | None = None) -> list[Question]:

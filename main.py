@@ -23,7 +23,10 @@ from backend import create_backend
 from benchmark.personaMem import PersonaMemV1
 from utils import (
     BACKEND_NAMES,
+    BENCHMARK_NAMES,
     BENCHMARK_SIZES,
+    BENCHMARK_SIZES_BY_BENCHMARK,
+    DEFAULT_BENCHMARK,
     DEFAULT_MAX_NEW_TOKENS,
     DEFAULT_METHOD,
     DEFAULT_MODEL,
@@ -53,6 +56,8 @@ def parse_args(argv=None) -> argparse.Namespace:
     )
     parser.add_argument("--method", choices=METHODS, default=DEFAULT_METHOD,
                         help="which solution to evaluate")
+    parser.add_argument("--benchmark", choices=BENCHMARK_NAMES, default=DEFAULT_BENCHMARK,
+                        help="which benchmark to evaluate (v1 = PersonaMem-v1, v2 = PersonaMem-v2)")
     parser.add_argument("--size", choices=BENCHMARK_SIZES, default=DEFAULT_SIZE,
                         help="benchmark context size")
     parser.add_argument("--backend", choices=BACKEND_NAMES, default="hf",
@@ -77,7 +82,11 @@ def parse_args(argv=None) -> argparse.Namespace:
     parser.add_argument("--api-key", default=None, help="api backend: API key (or LLM_API_KEY)")
     parser.add_argument("--api-model", default=None, help="api backend: model override")
     parser.add_argument("--verbose", action="store_true")
-    return parser.parse_args(argv)
+    args = parser.parse_args(argv)
+    if args.size not in BENCHMARK_SIZES_BY_BENCHMARK[args.benchmark]:
+        parser.error(f"--size {args.size} is not available for benchmark {args.benchmark} "
+                     f"(choose from {', '.join(BENCHMARK_SIZES_BY_BENCHMARK[args.benchmark])})")
+    return args
 
 
 def write_results(path: str, summary) -> None:
@@ -118,14 +127,15 @@ def main(argv=None) -> int:
     benchmark = PersonaMemV1(
         backend=backend,
         size=args.size,
+        benchmark=args.benchmark,
         seed_persona=args.seed_persona,
         cache=not args.no_cache,
         max_new_tokens=args.max_new_tokens,
     )
 
-    print(f"[main] method={args.method} size={args.size} backend={args.backend} "
-          f"model={args.model} seed_persona={args.seed_persona} cache={not args.no_cache} "
-          f"batch={args.batch}")
+    print(f"[main] benchmark={args.benchmark} method={args.method} size={args.size} "
+          f"backend={args.backend} model={args.model} seed_persona={args.seed_persona} "
+          f"cache={not args.no_cache} batch={args.batch}")
 
     summary = benchmark.evaluate(args.method, limit=args.limit, verbose=args.verbose,
                                  batch_size=args.batch)

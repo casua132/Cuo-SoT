@@ -1,7 +1,9 @@
 # LLM Personalization Enhancement: `cot` and `cot_opt`
 
 Two techniques for improving LLM response personalization, evaluated on the
-[PersonaMem-v1](https://huggingface.co/datasets/bowen-upenn/PersonaMem-v1) benchmark.
+[PersonaMem-v1](https://huggingface.co/datasets/bowen-upenn/PersonaMem-v1) and
+[PersonaMem-v2](https://huggingface.co/datasets/bowen-upenn/PersonaMem-v2) benchmarks
+(selectable via `--benchmark v1|v2`).
 
 ## Techniques
 
@@ -29,9 +31,10 @@ cut-off point.
 │   ├── cot_opt.md / cot_opt_sys.md     # cot_opt: select from a maintained state
 │   └── intent_induce.md / intent_induce_sys.md  # cot_opt: fold new info into the state
 ├── benchmark/
-│   ├── personaMem.py             # PersonaMemV1 evaluation harness
-│   ├── questions_*.csv           # benchmark questions (32k / 128k / 1M)
-│   └── shared_contexts_*.jsonl   # shared multi-turn conversation histories
+│   ├── personaMem.py             # PersonaMemV1 evaluation harness (v1 and v2)
+│   ├── questions_*.csv           # v1 benchmark questions (32k / 128k / 1M)
+│   ├── shared_contexts_*.jsonl   # v1 shared multi-turn conversation histories
+│   └── v2/                       # v2 data converted into the same on-disk layout
 ├── utils.py                      # constants + generic helpers
 ├── prompts.py                    # prompt loading / rendering / input formatting
 ├── state.py                      # implicit-state schema, parse & format
@@ -47,10 +50,12 @@ cut-off point.
 
 ```bash
 # 0. Optional: fetch the benchmark data into benchmark/
-python data_download.py --size 32k
+python data_download.py --size 32k                 # PersonaMem-v1
+python data_download.py --benchmark v2 --size 32k  # PersonaMem-v2 (downloaded + converted)
 
 # 1. Dry run with a deterministic stub backend (no model, validates the plumbing)
 python main.py --method cot_opt --backend stub --limit 5 --verbose
+python main.py --benchmark v2 --method cot --backend stub --limit 5 --verbose
 
 # 2. Real evaluation with a local transformers model
 #    (use the instruction-tuned gemma-4 variant, which is what the model card
@@ -70,6 +75,7 @@ python -m unittest discover -s tests -v
 | Flag | Meaning |
 | --- | --- |
 | `--method cot\|cot_opt` | which solution to evaluate |
+| `--benchmark v1\|v2` | which benchmark to evaluate (default `v1`; v2 sizes: `32k`/`128k`) |
 | `--size 32k\|128k\|1M` | benchmark context size |
 | `--backend hf\|api\|stub` | inference backend |
 | `--model NAME` | model id (default `google/gemma-4-E4B`) |
@@ -209,3 +215,4 @@ python -m unittest discover -s tests -v
 - *Hongru Wang* (2023). **Cue-CoT: Chain-of-thought Prompting for Responding to In-depth Dialogue Questions with LLMs**. 
 [![arXiv](https://img.shields.io/badge/arXiv-2305.11792-b31b1b.svg)](https://arxiv.org/abs/2305.11792)
 - *Bowen Jiang* (2025). **Know Me, Respond to Me: Benchmarking LLMs for Dynamic User Profiling and Personalized Responses at Scale**. [![arXiv](https://img.shields.io/badge/arXiv-2504.14225-b31b1b.svg)](https://arxiv.org/abs/2504.14225)
+- *Bowen Jiang* (2025). **PERSONAMEM-V2: Towards Personalized Intelligence via Learning Implicit User Personas and Agentic Memory**. [![arXiv](https://img.shields.io/badge/arXiv-2512.06688-b31b1b.svg)](https://arxiv.org/pdf/2512.06688)
