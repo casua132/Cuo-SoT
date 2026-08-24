@@ -1,0 +1,40 @@
+# Other # folders
+.claude/
+benchmark/*
+!benchmark/personaMem.py
+# files
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+
+# VS Code
+.vscode/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Logs
+*.log
+
+# Build
+build/
+dist/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Git
+*.swp
+
+# Model/Data
+checkpoints/
+outputs/
+cache/
+*.pt
+*.pth
+*.ckpt
