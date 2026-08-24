@@ -3,6 +3,7 @@
 benchmark/*
 !benchmark/personaMem.py
 # files
+*.ipynb
 
 # Python
 __pycache__/

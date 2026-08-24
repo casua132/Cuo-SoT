@@ -53,7 +53,9 @@ python data_download.py --size 32k
 python main.py --method cot_opt --backend stub --limit 5 --verbose
 
 # 2. Real evaluation with a local transformers model
-python main.py --method cot --backend hf --model google/gemma-4-E4B --size 32k --output results.csv
+#    (use the instruction-tuned gemma-4 variant, which is what the model card
+#    recommends for chat; the base model also works via the manual template)
+python main.py --method cot --backend hf --model google/gemma-4-E4B-it --size 32k --output results.csv
 
 # 3. Real evaluation through an OpenAI-compatible endpoint
 LLM_API_KEY=... LLM_API_BASE_URL=... \
@@ -125,6 +127,18 @@ and robustness issues:
    - `api` — any OpenAI-compatible endpoint.
    The original code imported a `transformers` model at module import time and used a
    non-standard loader/API; that is fixed and isolated.
+
+   The `hf` backend also handles tokenizers with **no `chat_template`**. The Gemma-4
+   family is one such case: the base `google/gemma-4-E4B` tokenizer has no
+   `chat_template`, so `apply_chat_template` raises `ValueError`. When the tokenizer
+   has no template, the backend builds the prompt manually in the canonical Gemma-4
+   format (`<|turn>…<turn|>` turns, `<|think|>` thinking gate, empty
+   `<|channel>thought\n<channel|>` block on the generation prompt), and falls back to
+   Gemma-2/3, ChatML, or a plain labeled format for other template-less models.
+   `tests/test_backend.py` pins the exact rendered prompts. Note that the
+   instruction-tuned **`google/gemma-4-E4B-it`** ships the official template and is
+   what the model card recommends for chat; prefer it over the base model for this
+   evaluation.
 
 6. **Answer extraction** is robust to the two output formats (state + identifier for
    `cot`; bare identifier for `cot_opt`) and to free-form model output.
