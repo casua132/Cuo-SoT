@@ -76,9 +76,33 @@ python -m unittest discover -s tests -v
 | `--limit N` | evaluate only the first N questions |
 | `--seed-persona` | `cot_opt` only (ablation): fold the persona system messages into the state |
 | `--no-cache` | `cot_opt` only: re-walk the state for every question |
-| `--output PATH` | write per-question results as CSV |
+| `--output PATH` | write per-question results as CSV (includes the raw `model_response`) |
 | `--api-base-url`, `--api-key`, `--api-model` | settings for the `api` backend |
-| `--max-new-tokens N`, `--verbose` | generation limit / progress output |
+| `--max-new-tokens N` | generation limit |
+| `--verbose` | per-question inference log: every model call's raw output (see below) |
+
+### Verbose inference log (`--verbose`)
+
+`--verbose` prints, for **each question**, every model inference call made for it —
+a header, the query, the model's **raw output**, the extracted/expected letters,
+and (for `cot_opt`) each `intent_induce` state update with the state delta:
+
+```
+=====================================================================
+Question 1/2  qid=...  type=recall_user_shared_facts  end_index=182
+=====================================================================
+[state:intent_induce] new_information="User message:\nHi there! I've ..." [truncated, 583 chars]
+  raw output: **name**: unknown
+**age**: unknown
+...
+  state delta: interest: 'unknown' -> 'music and technology'
+[answer:cot_opt] query="I recently attended an event ..."  options=4
+  raw output: (a)
+  extracted: 'a'   expected: 'c'
+```
+
+The same raw output is stored per question in the `--output` CSV's `model_response`
+column for later inspection.
 
 ## Implicit state
 

@@ -187,7 +187,12 @@ class HFBackend(LLMBackend):
                 return_tensors="pt",
                 **self.template_kwargs,
             )
-            if isinstance(chat, dict) and "input_ids" in chat:
+            # ``apply_chat_template(tokenize=True, return_dict=True)`` returns a
+            # ``transformers.BatchEncoding``, which is a ``UserDict`` — NOT a
+            # plain ``dict``. An ``isinstance(chat, dict)`` check silently misses
+            # it and would return the whole encoding as ``input_ids``. Duck-type
+            # on the key instead so both return types are handled.
+            if "input_ids" in chat:
                 return chat["input_ids"], chat.get("attention_mask")
             return chat, None
 

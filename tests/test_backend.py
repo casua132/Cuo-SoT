@@ -6,6 +6,7 @@ builders with a fake tokenizer and assert the exact rendered format.
 """
 
 import unittest
+from collections import UserDict
 
 from backend import HFBackend
 
@@ -134,7 +135,10 @@ class TestTokenizeDispatch(unittest.TestCase):
         fake = _FakeTok(chat_template="fake-template", known_tokens=("<|user|>",))
 
         def apply_chat_template(messages, **kwargs):
-            return {"input_ids": [[9, 9]], "attention_mask": [[1, 1]]}
+            # Real ``transformers`` returns a ``BatchEncoding``, a UserDict — not
+            # a plain dict. This is the return type that used to break the
+            # ``isinstance(chat, dict)`` guard in ``_tokenize``.
+            return UserDict({"input_ids": [[9, 9]], "attention_mask": [[1, 1]]})
 
         fake.apply_chat_template = apply_chat_template
         backend = make_backend(fake)
@@ -143,6 +147,19 @@ class TestTokenizeDispatch(unittest.TestCase):
         )
         self.assertEqual(ids, [[9, 9]])
         self.assertEqual(mask, [[1, 1]])
+
+    def test_uses_apply_chat_template_when_configured_plain_dict(self):
+        # Some transformers versions return a plain dict — both must work.
+        fake = _FakeTok(chat_template="fake-template", known_tokens=("<|user|>",))
+
+        def apply_chat_template(messages, **kwargs):
+            return {"input_ids": [[7]], "attention_mask": [[1]]}
+
+        fake.apply_chat_template = apply_chat_template
+        backend = make_backend(fake)
+        ids, mask = backend._tokenize([{"role": "user", "content": "hi"}])
+        self.assertEqual(ids, [[7]])
+        self.assertEqual(mask, [[1]])
 
     def test_manual_path_without_template(self):
         fake = _FakeTok(eot_token="<turn|>", bos_token="<bos>")

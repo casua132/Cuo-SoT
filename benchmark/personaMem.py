@@ -35,9 +35,17 @@ from backend import LLMBackend
 from data import BenchmarkData, Result, dialogue_messages
 from parsing import extract_answer
 from prompts import format_candidates, format_conversation, render, system_prompt
-from state import empty_state, format_user_state, parse_user_state
+from state import STATE_FIELDS, empty_state, format_user_state, parse_user_state
 
 _ROLE_PREFIX_RE = re.compile(r"^\s*(?:user|assistant|system)\s*:\s*", re.IGNORECASE)
+
+
+def _truncate(text, cap: int = 1200) -> str:
+    """Shorten a long string for logging, marking the truncation."""
+    text = str(text)
+    if len(text) <= cap:
+        return text
+    return f"{text[:cap]} ... [truncated, {len(text)} chars]"
 
 
 @dataclass
@@ -92,6 +100,36 @@ class PersonaMemV1:
         self.data = BenchmarkData(size=size, questions_path=questions_path, contexts_path=contexts_path)
         # shared_context_id -> {message_index: state}; one full-context walk per context.
         self._checkpoints: dict[str, dict[int, dict]] = {}
+        # Toggled by evaluate_*; read by the per-call inference log.
+        self._verbose = False
+
+    # ------------------------------------------------------------------
+    # Verbose inference log (per model call)
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _log_question_header(i: int, n: int, question) -> None:
+        print("=" * 78)
+        print(f"Question {i}/{n}  qid={question.question_id}  "
+              f"type={question.question_type}  end_index={question.end_index}")
+        print("=" * 78)
+
+    @staticmethod
+    def _log_answer_call(method: str, question, response: str, predicted) -> None:
+        """Log one answer-selection model call: query, raw output, extraction."""
+        print(f"[answer:{method}] query={_truncate(question.query, 120)!r}  "
+              f"options={len(question.all_options)}")
+        print(f"  raw output: {_truncate(response)}")
+        print(f"  extracted: {predicted!r}   expected: {question.correct_answer!r}")
+
+    @staticmethod
+    def _state_delta(prev: dict, new: dict) -> list[str]:
+        """Human-readable list of implicit-state fields that changed."""
+        changes = []
+        for key in STATE_FIELDS:
+            old, cur = str(prev.get(key, "")).strip(), str(new.get(key, "")).strip()
+            if old != cur:
+                changes.append(f"{key}: {old!r} -> {cur!r}")
+        return changes
 
     # ------------------------------------------------------------------
     # State maintenance (used by cot_opt)
@@ -108,7 +146,13 @@ class PersonaMemV1:
             {"role": "user", "content": user_prompt},
         ]
         response = self.backend.complete(messages, max_new_tokens=self.max_new_tokens)
-        return parse_user_state(response)
+        new_state = parse_user_state(response)
+        if self._verbose:
+            print(f"[state:intent_induce] new_information={_truncate(new_information, 120)!r}")
+            print(f"  raw output: {_truncate(response)}")
+            changes = self._state_delta(prev_state, new_state)
+            print("  state delta:", " | ".join(changes) if changes else "(no fields changed)")
+        return new_state
 
     def _build_checkpoints(self, messages: list[dict]) -> dict[int, dict]:
         """Walk a message list, checkpointing the state after every index.
@@ -155,11 +199,13 @@ class PersonaMemV1:
     # ------------------------------------------------------------------
     # Answer selection
     # ------------------------------------------------------------------
-    def _select_cot(self, question) -> str | None:
+    def _select_cot(self, question) -> tuple[str | None, str]:
         """cot: reason the implicit state from the dialogue, then pick a candidate.
 
         ``system`` persona messages are excluded: they contain the ground-truth
         profile, which would let the model answer without reasoning from the dialogue.
+
+        Returns ``(predicted_letter, raw_model_output)``.
         """
         messages_ctx = self.data.get_context_messages(question.shared_context_id, question.end_index)
         dialogue = dialogue_messages(messages_ctx)
@@ -174,10 +220,16 @@ class PersonaMemV1:
             {"role": "user", "content": user_prompt},
         ]
         response = self.backend.complete(messages, max_new_tokens=self.max_new_tokens)
-        return extract_answer(response)
+        predicted = extract_answer(response)
+        if self._verbose:
+            self._log_answer_call("cot", question, response, predicted)
+        return predicted, response
 
-    def _select_cot_opt(self, state: dict, question) -> str | None:
-        """cot_opt: use the maintained implicit state directly to pick a candidate."""
+    def _select_cot_opt(self, state: dict, question) -> tuple[str | None, str]:
+        """cot_opt: use the maintained implicit state directly to pick a candidate.
+
+        Returns ``(predicted_letter, raw_model_output)``.
+        """
         user_prompt = render(
             "cot_opt",
             implicit_state=format_user_state(state),
@@ -189,16 +241,22 @@ class PersonaMemV1:
             {"role": "user", "content": user_prompt},
         ]
         response = self.backend.complete(messages, max_new_tokens=self.max_new_tokens)
-        return extract_answer(response)
+        predicted = extract_answer(response)
+        if self._verbose:
+            self._log_answer_call("cot_opt", question, response, predicted)
+        return predicted, response
 
     # ------------------------------------------------------------------
     # Evaluation loops
     # ------------------------------------------------------------------
     def evaluate_cot(self, limit: int | None = None, verbose: bool = False) -> _Summary:
+        self._verbose = verbose
         results: list[Result] = []
         questions = self.data.load_questions(limit=limit)
         for i, q in enumerate(questions):
-            predicted = self._select_cot(q)
+            if verbose:
+                self._log_question_header(i + 1, len(questions), q)
+            predicted, response = self._select_cot(q)
             results.append(
                 Result(
                     question_id=q.question_id,
@@ -209,6 +267,7 @@ class PersonaMemV1:
                     correct=predicted == q.correct_answer,
                     shared_context_id=q.shared_context_id,
                     end_index=q.end_index,
+                    response=response,
                 )
             )
             if verbose:
@@ -216,11 +275,14 @@ class PersonaMemV1:
         return _Summary(results)
 
     def evaluate_cot_opt(self, limit: int | None = None, verbose: bool = False) -> _Summary:
+        self._verbose = verbose
         results: list[Result] = []
         questions = self.data.load_questions(limit=limit)
         for i, q in enumerate(questions):
+            if verbose:
+                self._log_question_header(i + 1, len(questions), q)
             state = self._state_for(q.shared_context_id, q.end_index)
-            predicted = self._select_cot_opt(state, q)
+            predicted, response = self._select_cot_opt(state, q)
             results.append(
                 Result(
                     question_id=q.question_id,
@@ -231,6 +293,7 @@ class PersonaMemV1:
                     correct=predicted == q.correct_answer,
                     shared_context_id=q.shared_context_id,
                     end_index=q.end_index,
+                    response=response,
                 )
             )
             if verbose:

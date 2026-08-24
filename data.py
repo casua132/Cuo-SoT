@@ -38,6 +38,7 @@ class Result:
     correct: bool
     shared_context_id: str
     end_index: int
+    response: str = ""  # raw model output of the answer call
 
     def as_row(self) -> dict:
         return {
@@ -47,6 +48,7 @@ class Result:
             "correct_answer": self.correct_answer,
             "predicted": self.predicted or "",
             "correct": int(self.correct),
+            "model_response": self.response,
             "shared_context_id": self.shared_context_id,
             "end_index_in_shared_context": self.end_index,
         }
