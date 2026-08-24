@@ -76,6 +76,7 @@ python -m unittest discover -s tests -v
 | `--limit N` | evaluate only the first N questions |
 | `--seed-persona` | `cot_opt` only (ablation): fold the persona system messages into the state |
 | `--no-cache` | `cot_opt` only: re-walk the state for every question |
+| `--batch None\|4\|8` | `hf` backend: samples per `generate()` call. `None`/`1` = sequential single-inference (default, exact per-sample behavior); `4`/`8` = batch that many independent samples per call |
 | `--output PATH` | write per-question results as CSV (includes the raw `model_response`) |
 | `--api-base-url`, `--api-key`, `--api-model` | settings for the `api` backend |
 | `--max-new-tokens N` | generation limit |
@@ -103,6 +104,31 @@ Question 1/2  qid=...  type=recall_user_shared_facts  end_index=182
 
 The same raw output is stored per question in the `--output` CSV's `model_response`
 column for later inspection.
+
+### Batched inference (`--batch`)
+
+The default (`--batch None`, equivalent to `1`) is the sequential single-inference
+path: one `generate()` call per sample, which reproduces the original per-sample
+behavior exactly. `--batch 4` / `--batch 8` groups independent samples into one
+batched `generate()` call (through `backend.complete_batch`) to exploit GPU
+headroom:
+
+- **`cot`** — the answer-selection calls across questions are independent, so they
+  are batched directly.
+- **`cot_opt`** — the answer-selection calls are batched, and so are the
+  `intent_induce` state updates, but **across different contexts in lockstep**:
+  updates *within* one context stay sequential (each update depends on the
+  previous state), while the update for turn *t* of every context runs in one
+  batched call. The per-context cache is reused exactly as in the sequential path.
+
+Batching does **not** change per-sample semantics: each row's attention is masked
+to its own tokens, so samples never interfere with each other, and the computed
+implicit states are identical to the sequential walk. The only difference is
+floating-point — a different batch shape changes the GEMM accumulation order, and
+greedy argmax can flip a token only when the logits are near-tied. In practice the
+outputs are identical for confident generations; on very small models a handful of
+near-tie answers may flip. For bit-exact reproducibility, run the whole evaluation
+through one mode (all `--batch None`, or all `--batch N`) rather than mixing them.
 
 ## Implicit state
 

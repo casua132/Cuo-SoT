@@ -11,9 +11,14 @@ Three backends are provided:
 All backends share the same interface::
 
     backend.complete(messages, max_new_tokens=1024) -> str
+    backend.complete_batch(messages_list, max_new_tokens=1024) -> list[str]
 
-where ``messages`` is a chat message list, e.g.
+``messages`` is a chat message list, e.g.
 ``[{"role": "system", "content": ...}, {"role": "user", "content": ...}]``.
+``complete_batch`` takes a list of such message lists and returns one response
+per input, in order — a pure throughput optimization, equivalent to calling
+``complete`` per item (the ``hf`` backend really batches them into one
+``generate()``; ``stub`` and ``api`` loop internally).
 """
 
 from __future__ import annotations
@@ -30,6 +35,23 @@ class LLMBackend:
 
     def complete(self, messages: list[dict], max_new_tokens: int | None = None) -> str:
         raise NotImplementedError
+
+    def complete_batch(
+        self,
+        messages_list: list[list[dict]],
+        max_new_tokens: int | None = None,
+    ) -> list[str]:
+        """Complete several independent message lists, one response per input.
+
+        Batching is purely a throughput optimization: every item is generated
+        independently and returned in the same order as ``messages_list``. A
+        batched result equals the sequential :meth:`complete` result up to
+        floating-point nondeterminism from the different GEMM shapes (greedy
+        argmax only flips near a logit tie). The default implementation loops
+        over :meth:`complete`; the ``hf`` backend overrides it with a real
+        batched ``generate()``.
+        """
+        return [self.complete(m, max_new_tokens=max_new_tokens) for m in messages_list]
 
 
 # ---------------------------------------------------------------------------
@@ -169,6 +191,75 @@ class HFBackend(LLMBackend):
             do_sample=False,
         )
         return self.tokenizer.decode(outputs[0][input_len:], skip_special_tokens=True)
+
+    def complete_batch(
+        self,
+        messages_list: list[list[dict]],
+        max_new_tokens: int | None = None,
+    ) -> list[str]:
+        """Complete several independent message lists in one batched call.
+
+        Each item is tokenized separately (chat template or manual prompt), then
+        all rows are left-padded to the longest sequence and decoded with a single
+        ``generate()``. Every row is generated independently — the causal mask and
+        the position ids are derived per row, so padding and other samples never
+        leak into a row's hidden states — and the returned list is in the same
+        order as ``messages_list``.
+
+        The only difference versus calling :meth:`complete` once per item is
+        floating-point: batching changes the GEMM shapes and therefore the
+        accumulation order, which can flip a greedy-argmax token only when the
+        logits are near-tied. Use a fully-batched run (rather than mixing batched
+        and solo runs) for bit-exact reproducibility.
+
+        The tokenizer's pad token is used for padding; if it has none, the EOS
+        token is used. Padding positions are masked out of attention, so their
+        embeddings never influence the output.
+        """
+        if not messages_list:
+            return []
+        self._ensure_loaded()
+        import torch
+
+        max_new_tokens = max_new_tokens or self.max_new_tokens
+        if self.tokenizer.pad_token_id is None:
+            if self.tokenizer.eos_token_id is None:
+                raise ValueError(
+                    f"Tokenizer for {self.model_name!r} has neither a pad nor an eos "
+                    "token, so left-padding the batch is impossible."
+                )
+            self.tokenizer.pad_token_id = self.tokenizer.eos_token_id
+        self.tokenizer.padding_side = "left"
+
+        rows: list[list[int]] = []
+        masks: list[list[int]] = []
+        for messages in messages_list:
+            input_ids, attention_mask = self._tokenize(messages)
+            row = input_ids.tolist()[0] if torch.is_tensor(input_ids) else list(input_ids[0])
+            rows.append(row)
+            if attention_mask is None:
+                masks.append([1] * len(row))
+            elif torch.is_tensor(attention_mask):
+                masks.append(attention_mask.tolist()[0])
+            else:
+                masks.append(list(attention_mask[0]))
+
+        max_len = max(len(row) for row in rows)
+        pad_id = self.tokenizer.pad_token_id
+        padded = [[pad_id] * (max_len - len(row)) + row for row in rows]
+        padded_mask = [[0] * (max_len - len(mask)) + mask for mask in masks]
+
+        device = self.model.device
+        outputs = self.model.generate(
+            input_ids=torch.tensor(padded, dtype=torch.long, device=device),
+            attention_mask=torch.tensor(padded_mask, dtype=torch.long, device=device),
+            max_new_tokens=max_new_tokens,
+            do_sample=False,
+        )
+        return [
+            self.tokenizer.decode(outputs[i][max_len:], skip_special_tokens=True)
+            for i in range(len(messages_list))
+        ]
 
     # ------------------------------------------------------------------ tokenize
     def _tokenize(self, messages: list[dict]) -> tuple:

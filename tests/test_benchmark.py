@@ -18,6 +18,18 @@ DATA_PRESENT = (BENCHMARK_DIR / "questions_32k.csv").exists()
 LIMIT = 10
 
 
+class _BatchSpyBackend(StubBackend):
+    """Deterministic stub that also records the size of every complete_batch call."""
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.batch_sizes: list[int] = []
+
+    def complete_batch(self, messages_list, max_new_tokens=None):
+        self.batch_sizes.append(len(messages_list))
+        return super().complete_batch(messages_list, max_new_tokens=max_new_tokens)
+
+
 @unittest.skipUnless(DATA_PRESENT, "benchmark 32k data not downloaded")
 class TestPipelineStub(unittest.TestCase):
     def make_benchmark(self, backend, **kwargs):
@@ -164,6 +176,60 @@ class TestPipelineStub(unittest.TestCase):
         # but it must contain the dialogue turns.
         self.assertIn("User:", user_prompt)
         self.assertIn("Assistant:", user_prompt)
+
+    # ------------------------------------------------------------------ batching
+    def test_cot_batched_matches_sequential(self):
+        seq = StubBackend(answer_response="(a)")
+        spy = _BatchSpyBackend(answer_response="(a)")
+        s1 = self.make_benchmark(seq).evaluate_cot(limit=LIMIT)
+        s2 = self.make_benchmark(spy).evaluate_cot(limit=LIMIT, batch_size=3)
+        self.assertEqual([r.question_id for r in s1.results], [r.question_id for r in s2.results])
+        self.assertEqual([r.predicted for r in s1.results], [r.predicted for r in s2.results])
+        # Same number of logical inference calls, just delivered in batches.
+        self.assertEqual(seq.call_count, spy.call_count)
+        self.assertEqual(spy.call_count, LIMIT)
+        self.assertTrue(spy.batch_sizes)
+        self.assertEqual(max(spy.batch_sizes), 3)
+
+    def test_cot_opt_batched_matches_sequential(self):
+        seq = StubBackend(answer_response="(a)")
+        spy = _BatchSpyBackend(answer_response="(a)")
+        s1 = self.make_benchmark(seq).evaluate_cot_opt(limit=LIMIT)
+        s2 = self.make_benchmark(spy).evaluate_cot_opt(limit=LIMIT, batch_size=2)
+        self.assertEqual([r.question_id for r in s1.results], [r.question_id for r in s2.results])
+        self.assertEqual([r.predicted for r in s1.results], [r.predicted for r in s2.results])
+        # Identical logical inference count: cache walk + answer calls, batched.
+        self.assertEqual(seq.call_count, spy.call_count)
+        self.assertTrue(spy.batch_sizes)
+        self.assertLessEqual(max(spy.batch_sizes), 2)
+
+    def test_cot_opt_batched_cache_hit(self):
+        spy = _BatchSpyBackend(answer_response="(a)")
+        bench = self.make_benchmark(spy)
+        bench.evaluate_cot_opt(limit=LIMIT, batch_size=2)
+        calls_after_first = spy.call_count
+        bench.evaluate_cot_opt(limit=LIMIT, batch_size=2)
+        calls_after_second = spy.call_count
+        # Second run reuses the cached walk: only the answer calls are re-inferred.
+        self.assertEqual(calls_after_second - calls_after_first, LIMIT)
+
+    def test_cot_opt_batched_without_cache_keeps_walk_sequential(self):
+        spy = _BatchSpyBackend(answer_response="(a)")
+        bench = self.make_benchmark(spy, cache=False)
+        summary = bench.evaluate_cot_opt(limit=LIMIT, batch_size=2)
+        self.assertEqual(len(summary.results), LIMIT)
+        # cache off: the per-question state walks stay sequential, the answer
+        # calls are batched.
+        self.assertTrue(spy.batch_sizes)
+        self.assertLessEqual(max(spy.batch_sizes), 2)
+
+    def test_batch_one_is_the_sequential_path(self):
+        spy = _BatchSpyBackend(answer_response="(a)")
+        bench = self.make_benchmark(spy)
+        bench.evaluate_cot(limit=LIMIT, batch_size=1)
+        # batch_size=1 never goes through complete_batch; complete() is used directly.
+        self.assertEqual(spy.batch_sizes, [])
+        self.assertEqual(spy.call_count, LIMIT)
 
 
 class TestCliStub(unittest.TestCase):

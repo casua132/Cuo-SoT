@@ -32,6 +32,20 @@ from utils import (
 )
 
 
+def _batch_size(value) -> int:
+    """Parse ``--batch``: ``None``/``0``/``1`` → sequential; ``N > 1`` → batching."""
+    if value is None:
+        return 1
+    if isinstance(value, str):
+        value = value.strip().lower()
+        if value in ("none", "", "null"):
+            return 1
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError("--batch must be None (sequential) or a positive integer")
+    return n
+
+
 def parse_args(argv=None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Evaluate the cot / cot-opt personalization solutions on PersonaMem.",
@@ -51,6 +65,11 @@ def parse_args(argv=None) -> argparse.Namespace:
                              "Off by default because the persona blocks contain the ground-truth profile.")
     parser.add_argument("--no-cache", action="store_true",
                         help="cot_opt only: do not reuse the per-context state walk across questions")
+    parser.add_argument("--batch", type=_batch_size, default=1,
+                        help="hf backend: samples per generate() call. None/1 = sequential "
+                             "single-inference (the default, exact per-sample results); "
+                             "4/8 = batch that many independent samples per call "
+                             "(faster, tiny fp differences near logit ties)")
     parser.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     parser.add_argument("--output", default=None,
                         help="optional path to write per-question results as CSV")
@@ -105,9 +124,11 @@ def main(argv=None) -> int:
     )
 
     print(f"[main] method={args.method} size={args.size} backend={args.backend} "
-          f"model={args.model} seed_persona={args.seed_persona} cache={not args.no_cache}")
+          f"model={args.model} seed_persona={args.seed_persona} cache={not args.no_cache} "
+          f"batch={args.batch}")
 
-    summary = benchmark.evaluate(args.method, limit=args.limit, verbose=args.verbose)
+    summary = benchmark.evaluate(args.method, limit=args.limit, verbose=args.verbose,
+                                 batch_size=args.batch)
     print_summary(summary)
 
     if args.output:

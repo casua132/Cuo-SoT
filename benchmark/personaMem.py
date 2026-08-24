@@ -134,24 +134,37 @@ class PersonaMemV1:
     # ------------------------------------------------------------------
     # State maintenance (used by cot_opt)
     # ------------------------------------------------------------------
-    def _update_state(self, prev_state: dict, new_information: str) -> dict:
-        """Ask the model to fold ``new_information`` into the user's implicit state."""
+    def _intent_induce_messages(self, prev_state: dict, new_information: str) -> list[dict]:
+        """Build the ``intent_induce`` chat messages for one state update."""
         user_prompt = render(
             "intent_induce",
             user_previous_state=format_user_state(prev_state),
             new_information=new_information,
         )
-        messages = [
+        return [
             {"role": "system", "content": system_prompt("intent_induce")},
             {"role": "user", "content": user_prompt},
         ]
+
+    @classmethod
+    def _log_state_update(cls, prev_state, new_state, response, new_information,
+                          context_id: str | None = None) -> None:
+        """Verbose log of one state-update inference call (sequential or batched)."""
+        prefix = "[state:intent_induce]"
+        if context_id is not None:
+            prefix += f" context={context_id}"
+        print(f"{prefix} new_information={_truncate(new_information, 120)!r}")
+        print(f"  raw output: {_truncate(response)}")
+        changes = cls._state_delta(prev_state, new_state)
+        print("  state delta:", " | ".join(changes) if changes else "(no fields changed)")
+
+    def _update_state(self, prev_state: dict, new_information: str) -> dict:
+        """Ask the model to fold ``new_information`` into the user's implicit state."""
+        messages = self._intent_induce_messages(prev_state, new_information)
         response = self.backend.complete(messages, max_new_tokens=self.max_new_tokens)
         new_state = parse_user_state(response)
         if self._verbose:
-            print(f"[state:intent_induce] new_information={_truncate(new_information, 120)!r}")
-            print(f"  raw output: {_truncate(response)}")
-            changes = self._state_delta(prev_state, new_state)
-            print("  state delta:", " | ".join(changes) if changes else "(no fields changed)")
+            self._log_state_update(prev_state, new_state, response, new_information)
         return new_state
 
     def _build_checkpoints(self, messages: list[dict]) -> dict[int, dict]:
@@ -180,6 +193,68 @@ class PersonaMemV1:
             checkpoints[idx] = dict(state)
         return checkpoints
 
+    def _prebuild_checkpoints_batched(self, context_ids: list[str], batch_size: int) -> None:
+        """Walk several contexts in lockstep, batching ``intent_induce`` across them.
+
+        Each context's walk is still strictly sequential — every state update
+        depends on the previous state, so the updates of one context can never be
+        batched with each other. But the walks of *different* contexts are fully
+        independent, so the update for turn ``t`` of every context is computed in
+        one ``complete_batch`` call. The result is stored into ``self._checkpoints``
+        exactly like the sequential cache, so :meth:`_state_for` reuses it.
+
+        Only used when ``cache`` is enabled; with ``cache=False`` the walks stay
+        sequential (each question's context is short-lived and re-walked on demand),
+        and only the answer-selection calls are batched. Contexts already present
+        in ``self._checkpoints`` are skipped, so repeated evaluations reuse the
+        cached walk.
+        """
+        context_ids = [cid for cid in context_ids if cid not in self._checkpoints]
+        if not context_ids:
+            return
+        msgs_by_ctx = {cid: self.data.contexts()[cid] for cid in context_ids}
+        max_len = max((len(msgs) for msgs in msgs_by_ctx.values()), default=0)
+        states = {cid: empty_state() for cid in context_ids}
+        checkpoints: dict[str, dict[int, dict]] = {cid: {} for cid in context_ids}
+        batch_size = max(1, batch_size)
+        for idx in range(max_len):
+            # Collect the state updates needed at this turn across all contexts.
+            updates: list[tuple[str, str]] = []  # (context_id, new_information)
+            for cid, msgs in msgs_by_ctx.items():
+                if idx >= len(msgs):
+                    continue
+                msg = msgs[idx]
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                if role == "system":
+                    if self.seed_persona:
+                        updates.append((cid, f"Updated user profile:\n{content}"))
+                elif role == "user":
+                    query = _ROLE_PREFIX_RE.sub("", content, count=1).strip()
+                    updates.append((cid, f"User message:\n{query}"))
+                # assistant turns carry no new user state.
+            for start in range(0, len(updates), batch_size):
+                chunk = updates[start:start + batch_size]
+                messages_list = [
+                    self._intent_induce_messages(states[cid], new_information)
+                    for cid, new_information in chunk
+                ]
+                responses = self.backend.complete_batch(
+                    messages_list, max_new_tokens=self.max_new_tokens
+                )
+                for (cid, new_information), response in zip(chunk, responses):
+                    prev = states[cid]
+                    states[cid] = parse_user_state(response)
+                    if self._verbose:
+                        self._log_state_update(
+                            prev, states[cid], response, new_information, context_id=cid
+                        )
+            for cid in context_ids:
+                if idx < len(msgs_by_ctx[cid]):
+                    checkpoints[cid][idx] = dict(states[cid])
+        for cid in context_ids:
+            self._checkpoints[cid] = checkpoints[cid]
+
     def _state_for(self, shared_context_id: str, end_index: int) -> dict:
         """Return the implicit state reached at ``end_index`` for a context."""
         end_index = int(end_index)
@@ -199,13 +274,11 @@ class PersonaMemV1:
     # ------------------------------------------------------------------
     # Answer selection
     # ------------------------------------------------------------------
-    def _select_cot(self, question) -> tuple[str | None, str]:
-        """cot: reason the implicit state from the dialogue, then pick a candidate.
+    def _cot_messages(self, question) -> list[dict]:
+        """Build the ``cot`` chat messages for one question.
 
         ``system`` persona messages are excluded: they contain the ground-truth
         profile, which would let the model answer without reasoning from the dialogue.
-
-        Returns ``(predicted_letter, raw_model_output)``.
         """
         messages_ctx = self.data.get_context_messages(question.shared_context_id, question.end_index)
         dialogue = dialogue_messages(messages_ctx)
@@ -215,89 +288,121 @@ class PersonaMemV1:
             user_query=question.query,
             candidate_responses=format_candidates(question.all_options),
         )
-        messages = [
+        return [
             {"role": "system", "content": system_prompt("cot")},
             {"role": "user", "content": user_prompt},
         ]
-        response = self.backend.complete(messages, max_new_tokens=self.max_new_tokens)
-        predicted = extract_answer(response)
-        if self._verbose:
-            self._log_answer_call("cot", question, response, predicted)
-        return predicted, response
 
-    def _select_cot_opt(self, state: dict, question) -> tuple[str | None, str]:
-        """cot_opt: use the maintained implicit state directly to pick a candidate.
-
-        Returns ``(predicted_letter, raw_model_output)``.
-        """
+    def _cot_opt_messages(self, state: dict, question) -> list[dict]:
+        """Build the ``cot_opt`` chat messages for one question from its state."""
         user_prompt = render(
             "cot_opt",
             implicit_state=format_user_state(state),
             user_query=question.query,
             candidate_responses=format_candidates(question.all_options),
         )
-        messages = [
+        return [
             {"role": "system", "content": system_prompt("cot_opt")},
             {"role": "user", "content": user_prompt},
         ]
-        response = self.backend.complete(messages, max_new_tokens=self.max_new_tokens)
-        predicted = extract_answer(response)
-        if self._verbose:
-            self._log_answer_call("cot_opt", question, response, predicted)
-        return predicted, response
+
+    @staticmethod
+    def _complete_or_batch(backend, messages_list: list[list[dict]], batch_size: int,
+                           max_new_tokens: int) -> list[str]:
+        """Run inference for one chunk, preserving the single-inference path.
+
+        ``batch_size == 1`` must go through ``complete`` (not ``complete_batch``)
+        so that ``--batch None`` reproduces the original per-sample behavior
+        exactly; larger batches go through ``complete_batch``.
+        """
+        if batch_size <= 1:
+            return [backend.complete(messages_list[0], max_new_tokens=max_new_tokens)]
+        return backend.complete_batch(messages_list, max_new_tokens=max_new_tokens)
+
+    @staticmethod
+    def _make_result(question, predicted: str | None, response: str) -> Result:
+        return Result(
+            question_id=question.question_id,
+            question_type=question.question_type,
+            topic=question.topic,
+            correct_answer=question.correct_answer,
+            predicted=predicted,
+            correct=predicted == question.correct_answer,
+            shared_context_id=question.shared_context_id,
+            end_index=question.end_index,
+            response=response,
+        )
 
     # ------------------------------------------------------------------
     # Evaluation loops
     # ------------------------------------------------------------------
-    def evaluate_cot(self, limit: int | None = None, verbose: bool = False) -> _Summary:
+    def evaluate_cot(self, limit: int | None = None, verbose: bool = False,
+                     batch_size: int = 1) -> _Summary:
+        """Evaluate ``cot``.
+
+        ``batch_size > 1`` groups the independent answer-selection calls into
+        ``complete_batch`` calls of that size. ``batch_size == 1`` is the
+        sequential single-inference path. Results are identical up to the
+        floating-point caveat documented on
+        :meth:`backend.LLMBackend.complete_batch`.
+        """
         self._verbose = verbose
         results: list[Result] = []
         questions = self.data.load_questions(limit=limit)
-        for i, q in enumerate(questions):
-            if verbose:
-                self._log_question_header(i + 1, len(questions), q)
-            predicted, response = self._select_cot(q)
-            results.append(
-                Result(
-                    question_id=q.question_id,
-                    question_type=q.question_type,
-                    topic=q.topic,
-                    correct_answer=q.correct_answer,
-                    predicted=predicted,
-                    correct=predicted == q.correct_answer,
-                    shared_context_id=q.shared_context_id,
-                    end_index=q.end_index,
-                    response=response,
-                )
+        batch_size = max(1, batch_size)
+        for start in range(0, len(questions), batch_size):
+            chunk = questions[start:start + batch_size]
+            messages_list = [self._cot_messages(q) for q in chunk]
+            responses = self._complete_or_batch(
+                self.backend, messages_list, batch_size, self.max_new_tokens
             )
-            if verbose:
-                self._log_progress(i + 1, len(questions), predicted, q.correct_answer, results)
+            for j, (q, response) in enumerate(zip(chunk, responses), start=start):
+                if verbose:
+                    self._log_question_header(j + 1, len(questions), q)
+                predicted = extract_answer(response)
+                if verbose:
+                    self._log_answer_call("cot", q, response, predicted)
+                results.append(self._make_result(q, predicted, response))
+                if verbose:
+                    self._log_progress(j + 1, len(questions), predicted, q.correct_answer, results)
         return _Summary(results)
 
-    def evaluate_cot_opt(self, limit: int | None = None, verbose: bool = False) -> _Summary:
+    def evaluate_cot_opt(self, limit: int | None = None, verbose: bool = False,
+                         batch_size: int = 1) -> _Summary:
+        """Evaluate ``cot_opt``.
+
+        ``batch_size > 1`` batches the independent work: the answer-selection
+        calls across questions, and — when the state-walk cache is enabled — the
+        ``intent_induce`` updates of *different* contexts in lockstep (updates
+        within one context stay sequential, since each update depends on the
+        previous state). ``batch_size == 1`` is the sequential single-inference
+        path.
+        """
         self._verbose = verbose
         results: list[Result] = []
         questions = self.data.load_questions(limit=limit)
-        for i, q in enumerate(questions):
-            if verbose:
-                self._log_question_header(i + 1, len(questions), q)
-            state = self._state_for(q.shared_context_id, q.end_index)
-            predicted, response = self._select_cot_opt(state, q)
-            results.append(
-                Result(
-                    question_id=q.question_id,
-                    question_type=q.question_type,
-                    topic=q.topic,
-                    correct_answer=q.correct_answer,
-                    predicted=predicted,
-                    correct=predicted == q.correct_answer,
-                    shared_context_id=q.shared_context_id,
-                    end_index=q.end_index,
-                    response=response,
-                )
+        batch_size = max(1, batch_size)
+        if batch_size > 1 and self.cache:
+            context_ids = sorted({q.shared_context_id for q in questions})
+            self._prebuild_checkpoints_batched(context_ids, batch_size)
+        for start in range(0, len(questions), batch_size):
+            chunk = questions[start:start + batch_size]
+            states = [self._state_for(q.shared_context_id, q.end_index) for q in chunk]
+            messages_list = [
+                self._cot_opt_messages(state, q) for state, q in zip(states, chunk)
+            ]
+            responses = self._complete_or_batch(
+                self.backend, messages_list, batch_size, self.max_new_tokens
             )
-            if verbose:
-                self._log_progress(i + 1, len(questions), predicted, q.correct_answer, results)
+            for j, (q, response) in enumerate(zip(chunk, responses), start=start):
+                if verbose:
+                    self._log_question_header(j + 1, len(questions), q)
+                predicted = extract_answer(response)
+                if verbose:
+                    self._log_answer_call("cot_opt", q, response, predicted)
+                results.append(self._make_result(q, predicted, response))
+                if verbose:
+                    self._log_progress(j + 1, len(questions), predicted, q.correct_answer, results)
         return _Summary(results)
 
     # Backward-compatible aliases returning the overall accuracy.
@@ -307,12 +412,13 @@ class PersonaMemV1:
     def cot_opt(self, limit: int | None = None) -> float:
         return self.evaluate_cot_opt(limit=limit).accuracy
 
-    def evaluate(self, method: str, limit: int | None = None, verbose: bool = False) -> _Summary:
+    def evaluate(self, method: str, limit: int | None = None, verbose: bool = False,
+                 batch_size: int = 1) -> _Summary:
         method = method.lower()
         if method == "cot":
-            return self.evaluate_cot(limit=limit, verbose=verbose)
+            return self.evaluate_cot(limit=limit, verbose=verbose, batch_size=batch_size)
         if method == "cot_opt":
-            return self.evaluate_cot_opt(limit=limit, verbose=verbose)
+            return self.evaluate_cot_opt(limit=limit, verbose=verbose, batch_size=batch_size)
         raise ValueError(f"Unknown method '{method}'. Choose from: cot, cot_opt")
 
     @staticmethod
