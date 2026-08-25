@@ -1,4 +1,4 @@
-# LLM Personalization Enhancement: `cot` and `cot_opt`
+# LLM Personalization Enhancement: `cot_opt`
 
 Two techniques for improving LLM response personalization, evaluated on the
 [PersonaMem-v1](https://huggingface.co/datasets/bowen-upenn/PersonaMem-v1) and
@@ -7,12 +7,7 @@ Two techniques for improving LLM response personalization, evaluated on the
 
 ## Techniques
 
-**`cot`** — *reason-then-answer.* Before selecting a response, the model is asked to
-infer the user's **implicit state** — who the user is, how they feel, what they want —
-from the full conversation history, then pick the best candidate response. The implicit
-state acts as a structured chain-of-thought that grounds the selection.
-
-**`cot_opt`** — *incremental state maintenance.* Instead of re-deriving the user's
+**`cot_opt`** — *incremental state maintenance.* Based on *Cuo-CoT*,instead of re-deriving the user's
 implicit state from the entire history on every new query (which re-reads up to 1M tokens
 each time), the state is **maintained across turns**: each user message updates the state
 through a cheap `intent_induce` step, and the final query is answered directly from the
