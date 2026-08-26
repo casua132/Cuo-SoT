@@ -81,6 +81,7 @@ python -m unittest discover -s tests -v
 | `--output PATH` | write per-question results as CSV (includes the raw `model_response`) |
 | `--api-base-url`, `--api-key`, `--api-model` | settings for the `api` backend |
 | `--max-new-tokens N` | generation limit |
+| `--great-exp-max N` | `cot_opt` only: character budget for the `Great_experience` field (default `1500`). When an update would grow it past this, one extra LLM call condenses it (fact-preserving) instead of truncating it. Lower it on a smaller GPU. |
 | `--verbose` | per-question inference log: every model call's raw output (see below) |
 
 ### Verbose inference log (`--verbose`)
@@ -144,9 +145,25 @@ and default to `unknown` when they cannot be inferred.
 
 Every field is maintained as the user's *current* state: when new information changes a
 field, the `intent_induce` prompt has the model rewrite it to the latest value rather than
-append to it, and no single field may grow past `MAX_FIELD_LEN` in `state.py` (extra text is
-trimmed from the tail). This keeps the state — and therefore the prompt/KV cache — bounded
-regardless of conversation length.
+append to it. `state.py` enforces two hard bounds so the state stays small no matter how the
+model behaves: `MAX_FIELD_LEN` caps any single field, and `MAX_STATE_LEN` caps the total
+across all fields (both keep the most recent text, trimming from the tail). This keeps the
+state — and therefore the prompt/KV cache — bounded regardless of conversation length.
+
+**`Great_experience` is the one exception:** significant past experiences legitimately
+*accumulate*, so it has its own budget (`--great-exp-max`, default `1500` chars). When an
+update would grow it past the budget, one extra LLM call condenses the whole field
+(fact-preserving: names, places, dates, events, achievements, skills, milestones are kept;
+redundancy is dropped) instead of silently truncating the tail. Parsing hard-caps the field
+at `min(MAX_STATE_LEN, 2 * great_exp_max)` so a single runaway output stays bounded, and
+`MAX_STATE_LEN` trims `Great_experience` last. The condensation calls are logged as
+`[state:great_exp_summarize]` and fire identically in the sequential and batched walks.
+
+**Memory budget.** The batched `cot_opt` walk groups one row per context (≤ 37 on the 32k
+split). gemma-4-E4B's KV cache is ≈ 86 KB/token/sequence (42 layers × 2 kv-heads × 256
+head-dim × bf16). With the total state ≤ 2500 chars (≈ 625 tokens), the worst-case walk call
+is ≈ 8.7 GB of KV, so a full run sits around 24–26 GB — comfortably inside a 40 GB GPU
+(`--great-exp-max 1500`).
 
 ## Design notes (deviations from the initial draft)
 
@@ -161,8 +178,11 @@ and robustness issues:
    every past value into each field (`*now …*` chains), so every field grows with every turn
    and the KV cache grows with it. The prompt now says each field is the user's **current**
    state — a field that changes is rewritten (not appended), and facts that remain valid are
-   carried forward unchanged. `state.MAX_FIELD_LEN` caps any single field as a hard backstop
-   so the state stays bounded even if a model drifts back to accumulating.
+   carried forward unchanged. `state.MAX_FIELD_LEN` (per field) and `state.MAX_STATE_LEN`
+   (total across all fields) are hard backstops so the state stays bounded even if a model
+   drifts back to accumulating. `Great_experience` is the deliberate exception — it is the
+   one field meant to accumulate — so it gets its own budget (`--great-exp-max`) and, on
+   overflow, a dedicated LLM condensation call rather than a tail-truncation.
 
 2. **No persona leakage.** The dataset's `system` messages are the ground-truth user
    profile (e.g. *"Current user persona: Name: Kanoa Manu — a 32-year-old software

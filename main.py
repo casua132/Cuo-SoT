@@ -76,6 +76,11 @@ def parse_args(argv=None) -> argparse.Namespace:
                              "4/8 = batch that many independent samples per call "
                              "(faster, tiny fp differences near logit ties)")
     parser.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
+    parser.add_argument("--great-exp-max", type=int, default=None,
+                        help="cot_opt only: character budget for the Great_experience field. "
+                             "When an update would grow it past this, the field is condensed "
+                             "by one LLM call (fact-preserving) instead of truncated. "
+                             "Default: 1500. Lower it on a smaller GPU.")
     parser.add_argument("--output", default=None,
                         help="optional path to write per-question results as CSV")
     parser.add_argument("--api-base-url", default=None, help="api backend: base URL")
@@ -131,11 +136,13 @@ def main(argv=None) -> int:
         seed_persona=args.seed_persona,
         cache=not args.no_cache,
         max_new_tokens=args.max_new_tokens,
+        great_exp_max=args.great_exp_max,
     )
 
     print(f"[main] benchmark={args.benchmark} method={args.method} size={args.size} "
           f"backend={args.backend} model={args.model} seed_persona={args.seed_persona} "
-          f"cache={not args.no_cache} batch={args.batch}")
+          f"cache={not args.no_cache} batch={args.batch} "
+          f"great_exp_max={benchmark.great_exp_max}")
 
     summary = benchmark.evaluate(args.method, limit=args.limit, verbose=args.verbose,
                                  batch_size=args.batch)

@@ -10,7 +10,8 @@ import unittest
 
 from backend import StubBackend
 from benchmark.personaMem import PersonaMemV1
-from state import empty_state, format_user_state
+from prompts import GREAT_EXP_SUMMARIZE_MARKER
+from state import GREAT_EXP_MAX, empty_state, format_user_state
 from utils import BENCHMARK_DIR
 
 DATA_PRESENT = (BENCHMARK_DIR / "questions_32k.csv").exists()
@@ -222,6 +223,60 @@ class TestPipelineStub(unittest.TestCase):
         # calls are batched.
         self.assertTrue(spy.batch_sizes)
         self.assertLessEqual(max(spy.batch_sizes), 2)
+
+    # ------------------------------------------------------------------ Great_experience condensation
+    def test_cot_opt_great_exp_summarization_fires(self):
+        """An over-budget Great_experience is condensed by an extra call; no prompt
+        ever embeds an uncondensed Great_experience above the budget, and the
+        batched walk triggers the same calls as the sequential one."""
+
+        def response_fn(messages):
+            system = messages[0]["content"]
+            if GREAT_EXP_SUMMARIZE_MARKER in system:
+                return "condensed: traveled the world; built software; produced music"
+            if "psychological expert" not in system:
+                return "(a)"
+            user = messages[1]["content"]
+            prev_block = user.split("User previous state:", 1)[1].split("New information:", 1)[0]
+            m = re.search(r"\*\*Great_experience\*\*\s*:\s*([^\n]*)", prev_block)
+            prev_ge = m.group(1).strip() if m else ""
+            new_ge = "x" * 300 if not prev_ge or prev_ge == "unknown" else prev_ge + "y" * 300
+            state = empty_state()
+            state["Great_experience"] = new_ge
+            return format_user_state(state)
+
+        seq = StubBackend(response_fn=response_fn)
+        s1 = self.make_benchmark(seq).evaluate_cot_opt(limit=LIMIT)
+        summarize_calls = [c for c in seq.calls if GREAT_EXP_SUMMARIZE_MARKER in c[0][0]["content"]]
+        self.assertTrue(summarize_calls, "expected at least one Great_experience condensation call")
+
+        # No prompt (state update or answer) embeds an uncondensed Great_experience.
+        for messages, _ in seq.calls:
+            if GREAT_EXP_SUMMARIZE_MARKER in messages[0]["content"]:
+                continue  # the condensation call's input is the bloated value by design
+            user = messages[1]["content"]
+            section = (user.split("User previous state:", 1)[1]
+                       if "User previous state:" in user
+                       else user.split("User Implicit State:", 1)[1])
+            m = re.search(r"\*\*Great_experience\*\*\s*:\s*([^\n]*)", section)
+            if m:
+                self.assertLessEqual(len(m.group(1)), GREAT_EXP_MAX,
+                                     "an uncondensed Great_experience was embedded in a prompt")
+
+        # The batched walk triggers the same condensation calls and results.
+        spy = _BatchSpyBackend(response_fn=response_fn)
+        s2 = self.make_benchmark(spy).evaluate_cot_opt(limit=LIMIT, batch_size=2)
+        self.assertEqual([r.question_id for r in s1.results], [r.question_id for r in s2.results])
+        self.assertEqual([r.predicted for r in s1.results], [r.predicted for r in s2.results])
+        self.assertEqual(seq.call_count, spy.call_count)
+
+    def test_cot_opt_default_stub_never_summarizes(self):
+        """With Great_experience staying at 'unknown' the walk adds no condensation calls."""
+        backend = StubBackend(answer_response="(a)")
+        bench = self.make_benchmark(backend)
+        bench.evaluate_cot_opt(limit=LIMIT)
+        for messages, _ in backend.calls:
+            self.assertNotIn(GREAT_EXP_SUMMARIZE_MARKER, messages[0]["content"])
 
     def test_batch_one_is_the_sequential_path(self):
         spy = _BatchSpyBackend(answer_response="(a)")

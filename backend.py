@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import os
 
+from prompts import GREAT_EXP_SUMMARIZE_MARKER
 from utils import DEFAULT_MAX_NEW_TOKENS, DEFAULT_MODEL
 
 
@@ -68,8 +69,10 @@ class StubBackend(LLMBackend):
     """Deterministic backend for tests and dry runs.
 
     Returns ``state_response`` for state-update calls (identified by the
-    ``intent_induce`` system prompt) and ``answer_response`` for answer calls.
-    A custom ``response_fn(messages) -> str | None`` can override this.
+    ``intent_induce`` system prompt), ``summarize_response`` for Great_experience
+    condensation calls (identified by the ``great_exp_summarize`` system prompt),
+    and ``answer_response`` for answer calls. A custom
+    ``response_fn(messages) -> str | None`` can override this.
     """
 
     name = "stub"
@@ -78,11 +81,14 @@ class StubBackend(LLMBackend):
         self,
         answer_response: str = "(a)",
         state_response: str | None = None,
+        summarize_response: str | None = None,
         response_fn=None,
         max_new_tokens: int | None = None,
     ) -> None:
         self.answer_response = answer_response
         self.state_response = state_response if state_response is not None else default_state_text()
+        self.summarize_response = (summarize_response if summarize_response is not None
+                                   else "A condensed summary of the user's significant experiences.")
         self.response_fn = response_fn
         self.max_new_tokens = max_new_tokens
         self.call_count = 0
@@ -96,6 +102,8 @@ class StubBackend(LLMBackend):
             if out is not None:
                 return out
         system = messages[0]["content"] if messages and messages[0]["role"] == "system" else ""
+        if GREAT_EXP_SUMMARIZE_MARKER in system:
+            return self.summarize_response
         if "psychological expert" in system:
             return self.state_response
         return self.answer_response

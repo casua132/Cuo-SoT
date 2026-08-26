@@ -17,6 +17,7 @@ _TEMPLATE_PLACEHOLDERS = {
     "cot": {"conversations", "user_query", "candidate_responses"},
     "cot_opt": {"implicit_state", "user_query", "candidate_responses"},
     "intent_induce": {"user_previous_state", "new_information"},
+    "great_exp_summarize": {"great_experience", "max_chars"},
 }
 
 # System-prompt file that pairs with each task template.
@@ -24,7 +25,13 @@ _SYSTEM_TEMPLATE = {
     "cot": "cot_sys",
     "cot_opt": "cot_opt_sys",
     "intent_induce": "intent_induce_sys",
+    "great_exp_summarize": "great_exp_summarize_sys",
 }
+
+# Distinctive phrase that appears verbatim in ``great_exp_summarize_sys.md``. The
+# stub backend uses it to recognize condensation calls (so they are not confused
+# with ``intent_induce`` state updates). It must not appear in any other prompt.
+GREAT_EXP_SUMMARIZE_MARKER = "distilling a person's accumulated life experiences"
 
 _cache: dict[str, str] = {}
 

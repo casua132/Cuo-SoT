@@ -35,7 +35,16 @@ from backend import LLMBackend
 from data import BenchmarkData, Result, dialogue_messages
 from parsing import extract_answer
 from prompts import format_candidates, format_conversation, render, system_prompt
-from state import STATE_FIELDS, empty_state, format_user_state, parse_user_state
+from state import (
+    STATE_FIELDS,
+    GREAT_EXP_MAX,
+    _cap_state,
+    clean_summary_response,
+    empty_state,
+    format_user_state,
+    needs_great_exp_summary,
+    parse_user_state,
+)
 
 _ROLE_PREFIX_RE = re.compile(r"^\s*(?:user|assistant|system)\s*:\s*", re.IGNORECASE)
 
@@ -86,6 +95,10 @@ class PersonaMemV1:
             sharing a context reuse the same inference. Requires a deterministic
             backend (use temperature 0) for exact results.
         max_new_tokens: generation limit passed to the backend.
+        great_exp_max: character budget for the ``Great_experience`` field; when
+            a state update would grow it beyond this, the field is condensed by
+            one extra LLM call instead of being truncated. Defaults to
+            ``state.GREAT_EXP_MAX``.
         questions_path / contexts_path: optional explicit data-file paths
             (mainly used in tests).
     """
@@ -98,6 +111,7 @@ class PersonaMemV1:
         seed_persona: bool = False,
         cache: bool = True,
         max_new_tokens: int = 1024,
+        great_exp_max: int | None = None,
         questions_path=None,
         contexts_path=None,
     ) -> None:
@@ -106,6 +120,7 @@ class PersonaMemV1:
         self.seed_persona = seed_persona
         self.cache = cache
         self.max_new_tokens = max_new_tokens
+        self.great_exp_max = great_exp_max if great_exp_max and great_exp_max > 0 else GREAT_EXP_MAX
         self.data = BenchmarkData(size=size, benchmark=benchmark,
                                   questions_path=questions_path, contexts_path=contexts_path)
         # shared_context_id -> {message_index: state}; one full-context walk per context.
@@ -156,6 +171,61 @@ class PersonaMemV1:
             {"role": "user", "content": user_prompt},
         ]
 
+    # ------------------------------------------------------------------
+    # Great_experience condensation
+    #
+    # ``Great_experience`` is the one accumulating field: when an update would grow
+    # it past its budget, one extra LLM call condenses it (fact-preserving) instead
+    # of silently truncating the tail. Triggered in both the sequential and the
+    # batched walk, so the two paths stay bit-consistent.
+    # ------------------------------------------------------------------
+    def _summarize_tokens(self) -> int:
+        """Generation budget for the condensation call (~4 chars/token + margin)."""
+        return int(self.great_exp_max / 3) + 64
+
+    def _summarize_great_exp_messages(self, experience: str) -> list[dict]:
+        """Build the condensation chat messages for one ``Great_experience`` value."""
+        user_prompt = render(
+            "great_exp_summarize",
+            great_experience=experience,
+            max_chars=self.great_exp_max,
+        )
+        return [
+            {"role": "system", "content": system_prompt("great_exp_summarize")},
+            {"role": "user", "content": user_prompt},
+        ]
+
+    @classmethod
+    def _log_great_exp_summary(cls, response: str,
+                               context_id: str | None = None,
+                               turn_idx: int | None = None,
+                               sample_idx: int | None = None,
+                               total_ctx: int | None = None) -> None:
+        """Verbose log of one ``Great_experience`` condensation call."""
+        prefix = "[state:great_exp_summarize]"
+        if context_id is not None:
+            prefix += f" context={context_id}"
+        if sample_idx is not None and total_ctx is not None:
+            prefix += f" sample={sample_idx + 1}/{total_ctx}"
+        if turn_idx is not None:
+            prefix += f" turn={turn_idx + 1}"
+        print(f"{prefix} condensed Great_experience (raw output: {_truncate(response)})")
+
+    def _summarize_great_exp(self, state: dict, **log_ctx) -> dict:
+        """Condense ``state``'s ``Great_experience`` in place, staying within the budget.
+
+        Re-caps the total afterward so the stored state is always bounded.
+        """
+        messages = self._summarize_great_exp_messages(state["Great_experience"])
+        response = self.backend.complete(
+            messages, max_new_tokens=self._summarize_tokens()
+        )
+        state["Great_experience"] = clean_summary_response(response, self.great_exp_max)
+        _cap_state(state)
+        if self._verbose:
+            self._log_great_exp_summary(response, **log_ctx)
+        return state
+
     @classmethod
     def _log_state_update(cls, prev_state, new_state, response, new_information,
                           context_id: str | None = None,
@@ -176,10 +246,16 @@ class PersonaMemV1:
         print("  state delta:", " | ".join(changes) if changes else "(no fields changed)")
 
     def _update_state(self, prev_state: dict, new_information: str) -> dict:
-        """Ask the model to fold ``new_information`` into the user's implicit state."""
+        """Ask the model to fold ``new_information`` into the user's implicit state.
+
+        If the update grows ``Great_experience`` past its budget, the field is
+        condensed by one extra call before the state is returned.
+        """
         messages = self._intent_induce_messages(prev_state, new_information)
         response = self.backend.complete(messages, max_new_tokens=self.max_new_tokens)
-        new_state = parse_user_state(response)
+        new_state = parse_user_state(response, great_exp_max=self.great_exp_max)
+        if needs_great_exp_summary(new_state, self.great_exp_max):
+            new_state = self._summarize_great_exp(new_state)
         if self._verbose:
             self._log_state_update(prev_state, new_state, response, new_information)
         return new_state
@@ -261,12 +337,39 @@ class PersonaMemV1:
                 responses = self.backend.complete_batch(
                     messages_list, max_new_tokens=self.max_new_tokens
                 )
+                parsed = []
                 for (cid, new_information), response in zip(chunk, responses):
                     prev = states[cid]
-                    states[cid] = parse_user_state(response)
+                    new = parse_user_state(response, great_exp_max=self.great_exp_max)
+                    parsed.append((cid, prev, new, response, new_information))
+                # Condense every Great_experience that overflowed its budget in one
+                # batch (same trigger as the sequential path, so results match).
+                over = [(cid, prev, new, response, info)
+                        for cid, prev, new, response, info in parsed
+                        if needs_great_exp_summary(new, self.great_exp_max)]
+                if over:
+                    sum_messages_list = [
+                        self._summarize_great_exp_messages(new["Great_experience"])
+                        for _, _, new, _, _ in over
+                    ]
+                    sum_responses = self.backend.complete_batch(
+                        sum_messages_list, max_new_tokens=self._summarize_tokens()
+                    )
+                    for (cid, _, new, _, _), sresponse in zip(over, sum_responses):
+                        new["Great_experience"] = clean_summary_response(
+                            sresponse, self.great_exp_max
+                        )
+                        _cap_state(new)
+                        if self._verbose:
+                            self._log_great_exp_summary(
+                                sresponse, context_id=cid, turn_idx=idx,
+                                sample_idx=context_index[cid], total_ctx=total_ctx,
+                            )
+                for cid, prev, new, response, new_information in parsed:
+                    states[cid] = new
                     if self._verbose:
                         self._log_state_update(
-                            prev, states[cid], response, new_information,
+                            prev, new, response, new_information,
                             context_id=cid,
                             turn_idx=idx,
                             sample_idx=context_index[cid],
