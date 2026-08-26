@@ -158,11 +158,18 @@ class PersonaMemV1:
 
     @classmethod
     def _log_state_update(cls, prev_state, new_state, response, new_information,
-                          context_id: str | None = None) -> None:
+                          context_id: str | None = None,
+                          turn_idx: int | None = None,
+                          sample_idx: int | None = None,
+                          total_ctx: int | None = None) -> None:
         """Verbose log of one state-update inference call (sequential or batched)."""
         prefix = "[state:intent_induce]"
         if context_id is not None:
             prefix += f" context={context_id}"
+        if sample_idx is not None and total_ctx is not None:
+            prefix += f" sample={sample_idx + 1}/{total_ctx}"
+        if turn_idx is not None:
+            prefix += f" turn={turn_idx + 1}"
         print(f"{prefix} new_information={_truncate(new_information, 120)!r}")
         print(f"  raw output: {_truncate(response)}")
         changes = cls._state_delta(prev_state, new_state)
@@ -227,6 +234,8 @@ class PersonaMemV1:
         states = {cid: empty_state() for cid in context_ids}
         checkpoints: dict[str, dict[int, dict]] = {cid: {} for cid in context_ids}
         batch_size = max(1, batch_size)
+        context_index = {cid: i for i, cid in enumerate(context_ids)}
+        total_ctx = len(context_ids)
         for idx in range(max_len):
             # Collect the state updates needed at this turn across all contexts.
             updates: list[tuple[str, str]] = []  # (context_id, new_information)
@@ -257,7 +266,11 @@ class PersonaMemV1:
                     states[cid] = parse_user_state(response)
                     if self._verbose:
                         self._log_state_update(
-                            prev, states[cid], response, new_information, context_id=cid
+                            prev, states[cid], response, new_information,
+                            context_id=cid,
+                            turn_idx=idx,
+                            sample_idx=context_index[cid],
+                            total_ctx=total_ctx,
                         )
             for cid in context_ids:
                 if idx < len(msgs_by_ctx[cid]):

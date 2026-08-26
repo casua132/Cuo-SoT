@@ -4,6 +4,7 @@ benchmark/*
 !benchmark/personaMem.py
 # files
 *.ipynb
+stat.md
 
 # Python
 __pycache__/
