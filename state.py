@@ -26,6 +26,13 @@ STATE_FIELDS = [
 
 UNKNOWN = "unknown"
 
+# Hard upper bound on any single state field. The full state is embedded into
+# every intent_induce / cot_opt prompt, so an unbounded field would make the
+# context grow every turn (and the KV cache with it). Values longer than this
+# keep only their most recent (current) portion. This is a backstop on top of
+# the prompt's "current state, never accumulate" instruction.
+MAX_FIELD_LEN = 2000
+
 # Matches a field marker such as "**name**:", tolerating the stray-quote
 # variants a model might emit ("**Great_experience**\" :").
 _FIELD_MARKER_RE = re.compile(r"\*\*([A-Za-z_]+)\*\*\s*\"?\s*:")
@@ -73,7 +80,8 @@ def parse_user_state(text: str | None) -> dict:
     Values may span multiple lines; each value runs until the next ``**field**:``
     marker. Fields that are missing from the output (or cannot be read) are filled
     with ``unknown``. Unknown extra markers are ignored but still terminate the
-    previous field's value.
+    previous field's value. Values longer than ``MAX_FIELD_LEN`` are trimmed to
+    their tail (the most recent, i.e. current, portion).
     """
     state = empty_state()
     if not text:
@@ -92,5 +100,10 @@ def parse_user_state(text: str | None) -> dict:
         end = markers[i + 1].start() if i + 1 < len(markers) else len(text)
         if field in state:
             value = _clean_value(text[start:end])
-            state[field] = value if value else UNKNOWN
+            if value:
+                if len(value) > MAX_FIELD_LEN:
+                    value = value[-MAX_FIELD_LEN:]
+                state[field] = value
+            else:
+                state[field] = UNKNOWN
     return state

@@ -142,16 +142,27 @@ knowledge, Great_experience, character`
 Values are meant to be concrete and vivid (e.g. *"a little excited, but also a little shy"*)
 and default to `unknown` when they cannot be inferred.
 
+Every field is maintained as the user's *current* state: when new information changes a
+field, the `intent_induce` prompt has the model rewrite it to the latest value rather than
+append to it, and no single field may grow past `MAX_FIELD_LEN` in `state.py` (extra text is
+trimmed from the tail). This keeps the state — and therefore the prompt/KV cache — bounded
+regardless of conversation length.
+
 ## Design notes (deviations from the initial draft)
 
 The initial draft's design is sound; the implementation below fixes several correctness
 and robustness issues:
 
-1. **State carry-forward.** The original `intent_induce` prompt said *"Do not keep the
-   user's previous state as the current state"*, which invites the model to *drop* stable
-   facts (name, age, long-standing preferences) on every update — the exact failure mode an
-   incremental-state method must avoid. The prompt now explicitly says to carry forward
-   every attribute that remains valid and only change fields with new evidence.
+1. **Fields hold the current state, not a growing log.** The original `intent_induce`
+   prompt said *"Do not keep the user's previous state as the current state"*, which invites
+   the model to *drop* stable facts (name, age, long-standing preferences) on every update —
+   the exact failure mode an incremental-state method must avoid. Fixing that drift the other
+   way is just as wrong: telling the model to *update evolving fields* makes it accumulate
+   every past value into each field (`*now …*` chains), so every field grows with every turn
+   and the KV cache grows with it. The prompt now says each field is the user's **current**
+   state — a field that changes is rewritten (not appended), and facts that remain valid are
+   carried forward unchanged. `state.MAX_FIELD_LEN` caps any single field as a hard backstop
+   so the state stays bounded even if a model drifts back to accumulating.
 
 2. **No persona leakage.** The dataset's `system` messages are the ground-truth user
    profile (e.g. *"Current user persona: Name: Kanoa Manu — a 32-year-old software

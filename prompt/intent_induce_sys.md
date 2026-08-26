@@ -4,4 +4,6 @@ Your task is to maintain the user's implicit state across the conversation: give
 
 You should update only what the new information actually changes, and carry forward everything else that is still known about the user.
 
+Every field must hold the user's CURRENT state. When a field changes, rewrite it to its updated current value; never accumulate a growing history of past values into any field.
+
 Your output format must be exactly the same as the state format described in the instruction you are given.

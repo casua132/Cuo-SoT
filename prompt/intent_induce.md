@@ -25,8 +25,10 @@ The user's implicit state is represented by the following fields:
 2. Update the state with the new information
 - The new information is either a new user message or an updated profile context.
 - Determine how the new information changes the user's implicit state.
-- Carry forward every attribute from the previous state that remains valid. Only modify a field when the new information provides evidence of a change. Do NOT drop previously established facts (e.g., name, age, location, occupation, long-standing preferences or interests) merely because the current message does not mention them.
-- For evolving fields (preference, interest, emotion, objective, knowledge, Great_experience, character), update them when the new information signals a change, and describe the change concretely and vividly. For example, use "a little excited, but also a little shy" rather than "excited"; use "in a cozy and warm room, listening to the rain outside, feeling warm and secure" rather than "home".
+- Every field always holds the user's CURRENT state — the latest, up-to-date value. A field is a current snapshot, never a history of past values.
+- When new information changes a field, REWRITE that field to its current value: fold the new information in and drop anything no longer true. Do NOT accumulate — never keep a running list of every past value (no growing "now ..." chains).
+- Carry forward every field that is still valid, unchanged, as the current state. Do NOT drop previously established facts (e.g., name, age, location, occupation, long-standing preferences or interests) merely because the current message does not mention them.
+- Keep each field concise and current. Describe concretely and vividly, e.g. use "a little excited, but also a little shy" rather than "excited"; use "in a cozy and warm room, listening to the rain outside, feeling warm and secure" rather than "home".
 
 3. Output
 - Output the complete updated state in the same format as the previous state, using all the fields above.

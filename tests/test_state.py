@@ -2,7 +2,7 @@
 
 import unittest
 
-from state import STATE_FIELDS, UNKNOWN, empty_state, format_user_state, parse_user_state
+from state import MAX_FIELD_LEN, STATE_FIELDS, UNKNOWN, empty_state, format_user_state, parse_user_state
 
 
 class TestState(unittest.TestCase):
@@ -77,6 +77,14 @@ Selected Candidate Response Identifier: (c)
         self.assertEqual(parse_user_state(None), empty_state())
         self.assertEqual(parse_user_state(""), empty_state())
         self.assertEqual(parse_user_state("no state here"), empty_state())
+
+    def test_parse_truncates_overlong_field(self):
+        # a runaway field must be capped so the embedded state stays bounded
+        tail = "y" * 500
+        long = "x" * (MAX_FIELD_LEN + 500)
+        state = parse_user_state(f"**preference**: {long}{tail}")
+        self.assertEqual(len(state["preference"]), MAX_FIELD_LEN)
+        self.assertTrue(state["preference"].endswith(tail), "keeps the most recent portion")
 
     def test_parse_unknown_extra_field_terminates_previous(self):
         text = """**name**: Kanoa
