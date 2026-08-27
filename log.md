@@ -4,7 +4,7 @@ The user's implicit state is a structured representation of who the user is and 
 
 Fields (all values should be concrete and vivid rather than brief labels; fill with "unknown" when a field cannot be inferred):
 
-Each field holds the user's **current** state — when a field changes it is rewritten to the latest value, never accumulated into a growing history. `state.MAX_FIELD_LEN` caps any single field and `state.MAX_STATE_LEN` caps the total across all fields as backstops.
+Each field holds the user's **current** state — when a field changes it is rewritten to the latest value, never accumulated into a growing history. On each update the model judges each field and outputs its current value, `unknown` (changed but the new value cannot be determined), or `unchanged` (no evidence of change); `merge_state` keeps the previous value for `unchanged` fields and applies everything else. `state.MAX_FIELD_LEN` caps any single field and `state.MAX_STATE_LEN` caps the total across all fields as backstops.
 
 **`Great_experience` is the exception**: significant past experiences accumulate. It has its own budget (`--great-exp-max`, default 1500 chars) and, when an update would grow it past that, one extra LLM call condenses the whole field (fact-preserving) instead of truncating it.
 

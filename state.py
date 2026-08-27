@@ -26,6 +26,20 @@ STATE_FIELDS = [
 
 UNKNOWN = "unknown"
 
+# Sentinel a field carries in an ``intent_induce`` update when the new information
+# does NOT change it. ``merge_state`` then keeps the previous value verbatim. This
+# is distinct from ``UNKNOWN``, which means the field DID change but its new value
+# cannot be determined (the old value no longer holds).
+UNCHANGED = "unchanged"
+
+# Accepted spellings of the carry-forward sentinel (checked against the whole value).
+_UNCHANGED_MARKERS = {"unchanged", "no change", "[unchanged]"}
+
+
+def is_unchanged(value) -> bool:
+    """Whether a field value is the ``unchanged`` carry-forward sentinel."""
+    return str(value).strip().lower() in _UNCHANGED_MARKERS
+
 # Hard upper bound on any single state field. The full state is embedded into
 # every intent_induce / cot_opt prompt, so an unbounded field would make the
 # context grow every turn (and the KV cache with it). Values longer than this
@@ -197,3 +211,23 @@ def parse_user_state(text: str | None, great_exp_max: int = GREAT_EXP_MAX) -> di
             else:
                 state[field] = UNKNOWN
     return _cap_state(state)
+
+
+def merge_state(prev: dict | None, new: dict) -> dict:
+    """Merge an update into the previous state, applying only genuine changes.
+
+    The model judges each field against the new information and writes one of
+    three things: its updated current value (the field changed and the new value
+    is determinable), the ``UNKNOWN`` sentinel (the field changed but its new
+    value cannot be determined — the old value no longer holds), or the
+    ``UNCHANGED`` sentinel (there is no evidence the field changed — its previous
+    value is kept as-is). Fields carrying ``UNCHANGED`` keep the previous value
+    verbatim; everything else — including a deliberate ``UNKNOWN`` — is applied.
+    The total is re-capped so the merged state stays bounded.
+    """
+    prev = prev or {}
+    merged = dict(new)
+    for field in STATE_FIELDS:
+        if is_unchanged(new.get(field, "")):
+            merged[field] = prev.get(field, UNKNOWN)
+    return _cap_state(merged)

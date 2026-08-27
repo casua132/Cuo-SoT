@@ -36,14 +36,28 @@ class TestTemplates(unittest.TestCase):
             render("cot", conversations="x", user_query="y")
 
     def test_render_cot_opt(self):
+        # recent_context="" is the update_every=1 case: byte-identical to the old
+        # prompt (state, one blank line, then the query).
         out = render(
             "cot_opt",
             implicit_state="**name**: Kanoa",
+            recent_context="",
             user_query="q",
             candidate_responses="(a) x",
         )
         self.assertIn("**name**: Kanoa", out)
         self.assertIn("q", out)
+        self.assertNotIn("Recent Conversation", out)
+        # a non-empty recent_context injects the short-term-memory block.
+        out2 = render(
+            "cot_opt",
+            implicit_state="**name**: Kanoa",
+            recent_context="\n\n# Recent Conversation (since the last state update)\n\nUser: hi\n\n",
+            user_query="q",
+            candidate_responses="(a) x",
+        )
+        self.assertIn("# Recent Conversation (since the last state update)", out2)
+        self.assertIn("User: hi", out2)
 
     def test_render_intent_induce(self):
         out = render(

@@ -22,17 +22,20 @@ The user's implicit state is represented by the following fields:
 1. Read the previous state
 - Read the user's previous implicit state carefully. It summarizes what is already known about the user.
 
-2. Update the state with the new information
-- The new information is either a new user message or an updated profile context.
-- Determine how the new information changes the user's implicit state.
-- Every field always holds the user's CURRENT state — the latest, up-to-date value. A field is a current snapshot, never a history of past values.
-- When new information changes a field, REWRITE that field to its current value: fold the new information in and drop anything no longer true. Do NOT accumulate — never keep a running list of every past value (no growing "now ..." chains).
-- Carry forward every field that is still valid, unchanged, as the current state. Do NOT drop previously established facts (e.g., name, age, location, occupation, long-standing preferences or interests) merely because the current message does not mention them.
-- Keep each field concise and current. Describe concretely and vividly, e.g. use "a little excited, but also a little shy" rather than "excited"; use "in a cozy and warm room, listening to the rain outside, feeling warm and secure" rather than "home".
+2. Decide, for EACH field, whether the new information changes it, and output one of three:
+
+- CHANGED — the new value is determinable: write the field's updated current value. Fold the new information in and drop anything no longer true. Never accumulate a history of past values (no growing "now ..." chains). Keep the value concise, concrete and vivid.
+- CHANGED — but the new value cannot be determined: write "unknown" for that field. The old value no longer holds. Example: the user clearly moved away from their previous location, but the new location is never named.
+- NOT CHANGED — or there is not enough information to show a change: write "unchanged" for that field. Its previous value is kept as-is.
+
+Rules:
+- A field is updated ONLY when the new information actually changes it. Never write "unknown" just because the current message does not mention a field — that is a lack of evidence of change, so write "unchanged".
+- "unknown" means the field genuinely changed but its new value cannot be determined; "unchanged" means it did not change.
+- Carry forward previously established facts (name, age, location, occupation, long-standing preferences or interests) unchanged unless the new information clearly contradicts or replaces them.
 
 3. Output
 - Output the complete updated state in the same format as the previous state, using all the fields above.
-- If a field cannot be inferred, fill it with "unknown" rather than leaving it blank.
+- Each field is one of: its current value, "unknown" (changed, but the new value cannot be determined), or "unchanged" (not changed).
 - Do not output anything other than the state fields.
 
 User previous state:

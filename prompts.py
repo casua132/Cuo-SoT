@@ -15,7 +15,7 @@ from utils import PROMPT_DIR
 # Required placeholders per template name (used for validation).
 _TEMPLATE_PLACEHOLDERS = {
     "cot": {"conversations", "user_query", "candidate_responses"},
-    "cot_opt": {"implicit_state", "user_query", "candidate_responses"},
+    "cot_opt": {"implicit_state", "recent_context", "user_query", "candidate_responses"},
     "intent_induce": {"user_previous_state", "new_information"},
     "great_exp_summarize": {"great_experience", "max_chars"},
 }

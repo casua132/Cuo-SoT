@@ -9,7 +9,8 @@ import re
 import unittest
 
 from backend import StubBackend
-from benchmark.personaMem import PersonaMemV1
+from benchmark.personaMem import PersonaMemV1, _update_schedule
+from data import dialogue_messages
 from prompts import GREAT_EXP_SUMMARIZE_MARKER
 from state import GREAT_EXP_MAX, empty_state, format_user_state
 from utils import BENCHMARK_DIR
@@ -17,6 +18,39 @@ from utils import BENCHMARK_DIR
 DATA_PRESENT = (BENCHMARK_DIR / "questions_32k.csv").exists()
 
 LIMIT = 10
+
+
+class TestUpdateSchedule(unittest.TestCase):
+    """The state-update schedule fires on the 1st, (1+N)-th, (1+2N)-th, ... user turn."""
+
+    def test_every_1_is_original(self):
+        msgs = [
+            {"role": "user", "content": "u1"},
+            {"role": "assistant", "content": "a1"},
+            {"role": "user", "content": "u2"},
+        ]
+        self.assertEqual(_update_schedule(msgs, 1, False), [0, 2])
+
+    def test_every_n_fires_on_first_and_then_every_n(self):
+        msgs = [{"role": "user", "content": f"u{i}"} for i in range(7)]
+        self.assertEqual(_update_schedule(msgs, 2, False), [0, 2, 4, 6])
+        self.assertEqual(_update_schedule(msgs, 3, False), [0, 3, 6])
+
+    def test_assistant_never_fires_and_system_only_under_seed_persona(self):
+        msgs = [
+            {"role": "system", "content": "s0"},
+            {"role": "user", "content": "u0"},
+            {"role": "assistant", "content": "a0"},
+            {"role": "user", "content": "u1"},
+            {"role": "user", "content": "u2"},
+        ]
+        # u1 (idx3) is the 2nd user turn (no fire); u2 (idx4) is the 3rd (fire).
+        self.assertEqual(_update_schedule(msgs, 2, False), [1, 4])
+        self.assertEqual(_update_schedule(msgs, 2, True), [0, 1, 4])
+
+    def test_every_is_clamped_to_1(self):
+        msgs = [{"role": "user", "content": f"u{i}"} for i in range(3)]
+        self.assertEqual(_update_schedule(msgs, 0, False), [0, 1, 2])
 
 
 class _BatchSpyBackend(StubBackend):
@@ -112,6 +146,111 @@ class TestPipelineStub(unittest.TestCase):
         # parse_user_state strips trailing whitespace from values, so normalize the
         # expected marker the same way.
         self.assertEqual(final_objective, last_user[:40].strip())
+
+    def test_cot_opt_update_every_throttles_state_updates(self):
+        """update_every=N recomputes the state every N user turns; the turns since
+        the last update are injected as short-term context into the answer call."""
+
+        def response_fn(messages):
+            system = messages[0]["content"]
+            if "psychological expert" not in system:
+                return "(a)"
+            user = messages[1]["content"]
+            if "User message:" in user:
+                marker = user.split("User message:", 1)[1].strip()[:40]
+            elif "Updated user profile:" in user:
+                marker = "PROFILE"
+            else:
+                marker = "NONE"
+            state = empty_state()
+            state["objective"] = marker
+            return format_user_state(state)
+
+        backend = StubBackend(response_fn=response_fn)
+        bench = self.make_benchmark(backend, update_every=3)
+        bench.evaluate_cot_opt(limit=1)
+
+        q = bench.data.load_questions(limit=1)[0]
+        msgs = bench.data.get_context_messages(q.shared_context_id, q.end_index)
+        user_turns = [i for i, m in enumerate(msgs) if m.get("role") == "user"]
+        update_idxs = _update_schedule(msgs, 3, False)
+        last_update = update_idxs[-1] if update_idxs else -1
+        recent = dialogue_messages(msgs[last_update + 1:])
+
+        # State-update calls are throttled to the scheduled update turns.
+        state_calls = [c for c in backend.calls
+                       if "psychological expert" in c[0][0]["content"]]
+        self.assertEqual(len(state_calls), len(update_idxs))
+        if len(user_turns) > 1:
+            self.assertLess(len(state_calls), len(user_turns))
+
+        # The stale state reflects the last update turn, not the last user turn.
+        user_prompt = backend.calls[-1][0][1]["content"]
+        if update_idxs:
+            last_msg = msgs[last_update]
+            last_marker = re.sub(r"^\s*(?:user|assistant|system)\s*:\s*", "",
+                                 last_msg.get("content", ""), count=1, flags=re.I).strip()[:40]
+            state_section = user_prompt.split("User Implicit State:", 1)[1]
+            m = re.search(r"\*\*objective\*\*\s*:\s*([^\n]*)", state_section)
+            self.assertTrue(m, "objective not found in the rendered state block")
+            self.assertEqual(m.group(1).strip(), last_marker,
+                             "state must hold the last UPDATE turn's snapshot")
+
+        # Turns since the last update are injected as short-term memory.
+        if recent:
+            self.assertIn("# Recent Conversation (since the last state update)", user_prompt)
+            for m in recent:
+                content = re.sub(r"^\s*(?:user|assistant|system)\s*:\s*", "",
+                                 m.get("content", ""), count=1, flags=re.I).strip()
+                self.assertIn(content, user_prompt)
+        else:
+            self.assertNotIn("# Recent Conversation", user_prompt)
+
+    def test_cot_opt_update_every_1_is_original(self):
+        """update_every=1 reproduces the original behaviour: one update per user
+        turn and no recent-context section in the answer prompt."""
+        backend = StubBackend(answer_response="(a)")
+        bench = self.make_benchmark(backend, update_every=1)
+        bench.evaluate_cot_opt(limit=1)
+
+        q = bench.data.load_questions(limit=1)[0]
+        msgs = bench.data.get_context_messages(q.shared_context_id, q.end_index)
+        user_turns = sum(1 for m in msgs if m.get("role") == "user")
+        state_calls = [c for c in backend.calls
+                       if "psychological expert" in c[0][0]["content"]]
+        self.assertEqual(len(state_calls), user_turns)
+        self.assertNotIn("# Recent Conversation", backend.calls[-1][0][1]["content"])
+
+    def test_cot_opt_carries_forward_unchanged_fields(self):
+        """A field the model marks 'unchanged' keeps its previous value in the state;
+        the 'unchanged' sentinel must never leak into the stored state."""
+
+        calls = {"n": 0}
+
+        def response_fn(messages):
+            system = messages[0]["content"]
+            if "psychological expert" not in system:
+                return "(a)"
+            calls["n"] += 1
+            state = empty_state()
+            if calls["n"] == 1:
+                state["name"] = "Kanoa"      # first turn establishes the name
+            else:
+                state["name"] = "unchanged"  # later turns: no evidence of change
+            state["objective"] = f"turn{calls['n']}"
+            return format_user_state(state)
+
+        backend = StubBackend(response_fn=response_fn)
+        bench = self.make_benchmark(backend)
+        bench.evaluate_cot_opt(limit=1)
+
+        # Last call is the cot_opt answer call; it embeds the final rendered state.
+        user_prompt = backend.calls[-1][0][1]["content"]
+        state_section = user_prompt.split("User Implicit State:", 1)[1]
+        m = re.search(r"\*\*name\*\*\s*:\s*([^\n]*)", state_section)
+        self.assertTrue(m, "name not found in the rendered state block")
+        self.assertEqual(m.group(1).strip(), "Kanoa",
+                         "'unchanged' must resolve to the previous value, not be stored")
 
     # ------------------------------------------------------------------ caching
     def test_cot_opt_cache_reuses_state_walk(self):

@@ -63,8 +63,7 @@ Return only the identifier of the selected candidate. Do not include any other t
 User Implicit State:
 
 {implicit_state}
-
-user query:
+{recent_context}user query:
 
 {user_query}
 

@@ -15,7 +15,11 @@ current state. At serving time this avoids re-reading the whole history on every
 
 On the offline benchmark, `cot_opt` is evaluated faithfully by walking the history once per
 context, caching the intermediate states, and answering each question from the state at its
-cut-off point.
+cut-off point. The state can be refreshed less often than every turn with `--update-every N`:
+the update fires on the 1st, (N+1)-th, (2N+1)-th, … user turn, and the answer call then
+injects the dialogue turns since the last update as short-term memory — cutting the number
+of `intent_induce` calls (and hence latency) roughly N-fold while the state stays a bounded,
+approximate snapshot. `--update-every 1` (the default) is the original every-turn behavior.
 
 ## Repository layout
 
@@ -82,6 +86,7 @@ python -m unittest discover -s tests -v
 | `--api-base-url`, `--api-key`, `--api-model` | settings for the `api` backend |
 | `--max-new-tokens N` | generation limit |
 | `--great-exp-max N` | `cot_opt` only: character budget for the `Great_experience` field (default `1500`). When an update would grow it past this, one extra LLM call condenses it (fact-preserving) instead of truncating it. Lower it on a smaller GPU. |
+| `--update-every N` | `cot_opt` only: recompute the user's implicit state every N user turns instead of every turn (default `1` = every turn). Larger N cuts the state-update LLM calls ~N-fold; the turns since the last update are then injected into the answer call as short-term memory. |
 | `--verbose` | per-question inference log: every model call's raw output (see below) |
 
 ### Verbose inference log (`--verbose`)
@@ -143,10 +148,15 @@ knowledge, Great_experience, character`
 Values are meant to be concrete and vivid (e.g. *"a little excited, but also a little shy"*)
 and default to `unknown` when they cannot be inferred.
 
-Every field is maintained as the user's *current* state: when new information changes a
-field, the `intent_induce` prompt has the model rewrite it to the latest value rather than
-append to it. `state.py` enforces two hard bounds so the state stays small no matter how the
-model behaves: `MAX_FIELD_LEN` caps any single field, and `MAX_STATE_LEN` caps the total
+Every field is maintained as the user's *current* state: the `intent_induce` prompt has the
+model decide, **per field**, whether the new information actually changes it, and output one
+of three things — its updated current value (changed, new value determinable), `unknown`
+(changed, but the new value cannot be determined — the old value no longer holds), or
+`unchanged` (no evidence the field changed; the previous value is kept). `merge_state`
+resolves `unchanged` back to the previous value and applies everything else, so a field is
+never rewritten without evidence of change, and a genuine change to an unknown value is not
+suppressed. `state.py` also enforces two hard bounds so the state stays small no matter how
+the model behaves: `MAX_FIELD_LEN` caps any single field, and `MAX_STATE_LEN` caps the total
 across all fields (both keep the most recent text, trimming from the tail). This keeps the
 state — and therefore the prompt/KV cache — bounded regardless of conversation length.
 

@@ -11,6 +11,7 @@ from state import (
     clean_summary_response,
     empty_state,
     format_user_state,
+    merge_state,
     needs_great_exp_summary,
     parse_user_state,
 )
@@ -154,6 +155,53 @@ Selected Candidate Response Identifier: (c)
             "objective": "o", "knowledge": "k", "Great_experience": "made music", "character": "c",
         })
         self.assertEqual(clean_summary_response(block, 500), "made music")
+
+    def test_merge_state_keeps_unchanged_fields(self):
+        # A field the model marks 'unchanged' (no evidence of change) keeps its
+        # previous value verbatim — this is the "don't blindly update" rule.
+        prev = empty_state()
+        prev["name"] = "Kanoa"
+        prev["location"] = "Honolulu"
+        new = empty_state()
+        new["name"] = "unchanged"
+        new["location"] = "no change"
+        new["interest"] = "music"    # genuine new information
+        merged = merge_state(prev, new)
+        self.assertEqual(merged["name"], "Kanoa")
+        self.assertEqual(merged["location"], "Honolulu")
+        self.assertEqual(merged["interest"], "music")
+
+    def test_merge_state_applies_changed_to_unknown(self):
+        # A genuine change whose new value is unknowable ("the old location no
+        # longer holds") IS applied — 'unknown' is a legitimate update here.
+        prev = empty_state()
+        prev["location"] = "Honolulu"
+        new = empty_state()
+        new["location"] = "unknown"
+        merged = merge_state(prev, new)
+        self.assertEqual(merged["location"], UNKNOWN)
+
+    def test_merge_state_applies_new_values_and_unchanged_markers(self):
+        prev = empty_state()
+        prev["name"] = "Kanoa"
+        prev["emotion"] = "calm"
+        new = empty_state()
+        new["name"] = "Kanoa Manu"   # changed
+        new["emotion"] = "unchanged"  # carried forward
+        new["age"] = "32"            # newly established
+        merged = merge_state(prev, new)
+        self.assertEqual(merged["name"], "Kanoa Manu")
+        self.assertEqual(merged["emotion"], "calm")
+        self.assertEqual(merged["age"], "32")
+
+    def test_merge_state_unchanged_first_update_stays_unknown(self):
+        # With no previous state, 'unchanged' keeps the field unknown.
+        new = empty_state()
+        new["name"] = "unchanged"
+        new["age"] = "32"
+        merged = merge_state(None, new)
+        self.assertEqual(merged["name"], UNKNOWN)
+        self.assertEqual(merged["age"], "32")
 
     def test_parse_unknown_extra_field_terminates_previous(self):
         text = """**name**: Kanoa

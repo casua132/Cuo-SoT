@@ -14,16 +14,20 @@ Evaluation strategies
     re-derived from the full history on every question. The dialogue history is
     walked once per ``shared_context_id``:
 
-      * a ``user`` turn updates the state through the ``intent_induce`` prompt;
+      * a ``user`` turn updates the state through the ``intent_induce`` prompt —
+        under ``update_every=N`` only every N-th user turn (default ``1`` = every
+        turn), so the state between updates is a stale snapshot;
       * ``assistant`` turns carry no new user state and are skipped;
       * ``system`` persona messages are excluded by default (they encode the
         ground-truth profile and would let the model answer without reasoning).
         They can be included as an ablation via ``seed_persona=True``.
 
     The final query is then answered with the ``cot_opt`` prompt using the state
-    reached at the question's ``end_index``. Because the walk is cached per context
-    and checkpointed at every message index, all questions sharing a context reuse
-    the same inference (questions only differ by their ``end_index`` cut-off).
+    reached at the question's ``end_index``; with a longer ``update_every`` the
+    dialogue turns since the last update are injected as short-term memory. Because
+    the walk is cached per context and checkpointed at every message index, all
+    questions sharing a context reuse the same inference (questions only differ by
+    their ``end_index`` cut-off).
 """
 
 from __future__ import annotations
@@ -42,11 +46,36 @@ from state import (
     clean_summary_response,
     empty_state,
     format_user_state,
+    merge_state,
     needs_great_exp_summary,
     parse_user_state,
 )
 
 _ROLE_PREFIX_RE = re.compile(r"^\s*(?:user|assistant|system)\s*:\s*", re.IGNORECASE)
+
+
+def _update_schedule(messages: list[dict], every: int, seed_persona: bool) -> list[int]:
+    """Message indices at which a ``cot_opt`` state update fires.
+
+    A ``user`` turn fires an update when it is the ``1 + k*every``-th user turn
+    (``every=1`` → every user turn, the original behaviour). ``system`` persona
+    messages fire only under ``seed_persona`` (the profile ablation); ``assistant``
+    turns never fire. Both the checkpoint walks and the per-question recent-context
+    computation use this same schedule, so they stay consistent.
+    """
+    every = max(1, every)
+    idxs: list[int] = []
+    user_turn = 0
+    for idx, msg in enumerate(messages):
+        role = msg.get("role", "user")
+        if role == "system":
+            if seed_persona:
+                idxs.append(idx)
+        elif role == "user":
+            user_turn += 1
+            if (user_turn - 1) % every == 0:
+                idxs.append(idx)
+    return idxs
 
 
 def _truncate(text, cap: int = 1200) -> str:
@@ -99,6 +128,10 @@ class PersonaMemV1:
             a state update would grow it beyond this, the field is condensed by
             one extra LLM call instead of being truncated. Defaults to
             ``state.GREAT_EXP_MAX``.
+        update_every: recompute the user's implicit state every ``update_every``
+            user turns instead of every turn (``1`` = the original behaviour).
+            Between updates the state is a stale snapshot; the answer call then
+            injects the dialogue turns since the last update as short-term memory.
         questions_path / contexts_path: optional explicit data-file paths
             (mainly used in tests).
     """
@@ -112,6 +145,7 @@ class PersonaMemV1:
         cache: bool = True,
         max_new_tokens: int = 1024,
         great_exp_max: int | None = None,
+        update_every: int = 1,
         questions_path=None,
         contexts_path=None,
     ) -> None:
@@ -121,6 +155,7 @@ class PersonaMemV1:
         self.cache = cache
         self.max_new_tokens = max_new_tokens
         self.great_exp_max = great_exp_max if great_exp_max and great_exp_max > 0 else GREAT_EXP_MAX
+        self.update_every = max(1, update_every)
         self.data = BenchmarkData(size=size, benchmark=benchmark,
                                   questions_path=questions_path, contexts_path=contexts_path)
         # shared_context_id -> {message_index: state}; one full-context walk per context.
@@ -248,12 +283,17 @@ class PersonaMemV1:
     def _update_state(self, prev_state: dict, new_information: str) -> dict:
         """Ask the model to fold ``new_information`` into the user's implicit state.
 
-        If the update grows ``Great_experience`` past its budget, the field is
-        condensed by one extra call before the state is returned.
+        The parsed update is merged against the previous state: the model judges
+        each field and writes either its current value, ``unknown`` (the field
+        changed but its new value cannot be determined), or ``unchanged`` (no
+        evidence of change — the previous value is kept). If the update grows
+        ``Great_experience`` past its budget, the field is condensed by one extra
+        call before the state is returned.
         """
         messages = self._intent_induce_messages(prev_state, new_information)
         response = self.backend.complete(messages, max_new_tokens=self.max_new_tokens)
         new_state = parse_user_state(response, great_exp_max=self.great_exp_max)
+        new_state = merge_state(prev_state, new_state)
         if needs_great_exp_summary(new_state, self.great_exp_max):
             new_state = self._summarize_great_exp(new_state)
         if self._verbose:
@@ -266,23 +306,29 @@ class PersonaMemV1:
         ``checkpoints[i]`` is the state after processing ``messages[:i+1]``, so the
         state at a question's ``end_index`` is ``checkpoints[end_index - 1]``.
 
-        Only ``user`` turns update the state (and ``system`` persona messages when
-        ``seed_persona`` is enabled as an ablation). ``assistant`` turns and, by
-        default, ``system`` persona messages leave the state unchanged — the persona
-        blocks encode the ground-truth profile and must not be handed to the model.
+        Only ``user`` turns update the state — and, under ``update_every=N``, only
+        every N-th one (see :func:`_update_schedule`). ``system`` persona messages
+        update the state only when ``seed_persona`` is enabled as an ablation.
+        ``assistant`` turns and, by default, ``system`` persona messages leave the
+        state unchanged — the persona blocks encode the ground-truth profile and
+        must not be handed to the model. Between updates the state is carried
+        forward unchanged, so mid-interval checkpoints hold a stale snapshot; the
+        answer call compensates by injecting the turns since the last update (see
+        :meth:`_recent_context_for`).
         """
+        update_at = set(_update_schedule(messages, self.update_every, self.seed_persona))
         checkpoints: dict[int, dict] = {}
         state = empty_state()
         for idx, msg in enumerate(messages):
-            role = msg.get("role", "user")
-            content = msg.get("content", "")
-            if role == "system":
-                if self.seed_persona:
+            if idx in update_at:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                if role == "system":
                     state = self._update_state(state, f"Updated user profile:\n{content}")
-            elif role == "user":
-                query = _ROLE_PREFIX_RE.sub("", content, count=1).strip()
-                state = self._update_state(state, f"User message:\n{query}")
-            # assistant turns carry no new user state.
+                else:
+                    query = _ROLE_PREFIX_RE.sub("", content, count=1).strip()
+                    state = self._update_state(state, f"User message:\n{query}")
+            # assistant turns and non-update user turns carry no new state.
             checkpoints[idx] = dict(state)
         return checkpoints
 
@@ -306,6 +352,12 @@ class PersonaMemV1:
         if not context_ids:
             return
         msgs_by_ctx = {cid: self.data.contexts()[cid] for cid in context_ids}
+        # Same update schedule as the sequential walk (per context), so the batched
+        # path stays bit-consistent with it.
+        update_at = {
+            cid: set(_update_schedule(msgs, self.update_every, self.seed_persona))
+            for cid, msgs in msgs_by_ctx.items()
+        }
         max_len = max((len(msgs) for msgs in msgs_by_ctx.values()), default=0)
         states = {cid: empty_state() for cid in context_ids}
         checkpoints: dict[str, dict[int, dict]] = {cid: {} for cid in context_ids}
@@ -316,18 +368,17 @@ class PersonaMemV1:
             # Collect the state updates needed at this turn across all contexts.
             updates: list[tuple[str, str]] = []  # (context_id, new_information)
             for cid, msgs in msgs_by_ctx.items():
-                if idx >= len(msgs):
+                if idx >= len(msgs) or idx not in update_at[cid]:
                     continue
                 msg = msgs[idx]
                 role = msg.get("role", "user")
                 content = msg.get("content", "")
                 if role == "system":
-                    if self.seed_persona:
-                        updates.append((cid, f"Updated user profile:\n{content}"))
-                elif role == "user":
+                    updates.append((cid, f"Updated user profile:\n{content}"))
+                else:
                     query = _ROLE_PREFIX_RE.sub("", content, count=1).strip()
                     updates.append((cid, f"User message:\n{query}"))
-                # assistant turns carry no new user state.
+                # assistant turns and non-update user turns carry no new state.
             for start in range(0, len(updates), batch_size):
                 chunk = updates[start:start + batch_size]
                 messages_list = [
@@ -341,6 +392,7 @@ class PersonaMemV1:
                 for (cid, new_information), response in zip(chunk, responses):
                     prev = states[cid]
                     new = parse_user_state(response, great_exp_max=self.great_exp_max)
+                    new = merge_state(prev, new)  # only genuine changes apply
                     parsed.append((cid, prev, new, response, new_information))
                 # Condense every Great_experience that overflowed its budget in one
                 # batch (same trigger as the sequential path, so results match).
@@ -419,11 +471,36 @@ class PersonaMemV1:
             {"role": "user", "content": user_prompt},
         ]
 
+    def _recent_context_for(self, question) -> str:
+        """Dialogue turns since the last state update, as context for the answer call.
+
+        With ``update_every=1`` the state is current, so nothing is injected and the
+        rendered prompt is byte-identical to the original (the value is just the
+        blank-line separator). With a longer interval the state is a stale snapshot,
+        so the turns that have not yet been folded into it are appended as short-term
+        memory. ``system`` persona messages are excluded (they would leak the
+        ground-truth profile).
+        """
+        if self.update_every <= 1:
+            return "\n\n"
+        messages_ctx = self.data.get_context_messages(
+            question.shared_context_id, question.end_index
+        )
+        update_idxs = _update_schedule(messages_ctx, self.update_every, self.seed_persona)
+        last_update = update_idxs[-1] if update_idxs else -1
+        recent = dialogue_messages(messages_ctx[last_update + 1:])
+        if not recent:
+            return "\n\n"
+        return ("\n\n# Recent Conversation (since the last state update)\n\n"
+                + format_conversation(recent)
+                + "\n\n")
+
     def _cot_opt_messages(self, state: dict, question) -> list[dict]:
         """Build the ``cot_opt`` chat messages for one question from its state."""
         user_prompt = render(
             "cot_opt",
             implicit_state=format_user_state(state),
+            recent_context=self._recent_context_for(question),
             user_query=question.query,
             candidate_responses=format_candidates(question.all_options),
         )
